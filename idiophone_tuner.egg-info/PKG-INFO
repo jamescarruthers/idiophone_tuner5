@@ -1,0 +1,104 @@
+Metadata-Version: 2.4
+Name: idiophone_tuner
+Version: 0.1.0
+Summary: FEM-based optimization of idiophone bars using Timoshenko beam theory
+Author: James
+License: MIT
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: numpy>=1.21
+Requires-Dist: scipy>=1.7
+Provides-Extra: plot
+Requires-Dist: matplotlib>=3.5; extra == "plot"
+
+# Idiophone Bar Tuner
+
+FEM-based optimization of idiophone bars (xylophones, marimbas, glockenspiels) using Timoshenko beam theory.
+
+## Features
+
+- Timoshenko beam finite element analysis (includes shear deformation and rotary inertia)
+- Material database (woods: sapele, rosewood, padauk, maple; metals: aluminum, bronze, steel)
+- Narrow slot undercut optimization for tuning
+- Target frequency and ratio optimization (xylophone 1:3:6, marimba 1:4:10, etc.)
+
+## Installation
+
+```bash
+cd idiophone_tuner
+pip install -e .
+```
+
+Or with plotting support:
+```bash
+pip install -e ".[plot]"
+```
+
+## Quick Start
+
+### Python API
+
+```python
+from idiophone_tuner import (
+    create_bar, get_material, optimize_bar,
+    TuningTarget, UndercutConfig, quick_analysis
+)
+
+# Analyze an existing bar
+result = quick_analysis(480, 32, 24, 'sapele')  # L x W x H in mm
+print(f"Frequencies: {result['frequencies_hz']}")
+print(f"Ratios: {result['ratios']}")
+
+# Optimize for F4 xylophone tuning (1:3:6)
+bar = create_bar(543, 32, 24)  # mm
+material = get_material('sapele')
+target = TuningTarget.from_note('F4', ratios=(1, 3, 6))
+config = UndercutConfig.multi_point(n_cuts=7, width_mm=1.0)
+
+result = optimize_bar(bar, material, target, config, n_elements=800)
+print(result.summary())
+```
+
+### CLI
+
+```bash
+# Analyze a bar
+python -m idiophone_tuner analyze --length 480 --width 32 --thickness 24 --material sapele
+
+# Estimate length for a target note
+python -m idiophone_tuner estimate --note F4 --width 32 --thickness 24 --material sapele
+
+# Optimize undercuts
+python -m idiophone_tuner optimize --note F4 --width 32 --thickness 24 --material sapele \
+    --tuning xylophone --cuts 7 --cut-width 1.0 --elements 800
+
+# List materials
+python -m idiophone_tuner materials
+```
+
+## Element Count
+
+For narrow cuts (1mm), use high element counts (800+) to properly resolve the geometry.
+For wider cuts or quick estimates, 100-200 elements is sufficient.
+
+## Tuning Ratios
+
+| Instrument   | Ratios      |
+|-------------|-------------|
+| Xylophone   | 1:3:6       |
+| Marimba     | 1:4:10      |
+| Vibraphone  | 1:4         |
+| Glockenspiel| 1:2.76:5.4  |
+
+## Theory
+
+Uses 2-node Timoshenko beam elements with:
+- 4 DOF per node (transverse displacement w, rotation θ)
+- Shear correction factor κ = 5/6 for rectangular sections
+- Consistent mass matrix with rotary inertia
+- Free-free boundary conditions
+
+The Timoshenko formulation is more accurate than Euler-Bernoulli for:
+- Thick bars (depth/length > 0.1)
+- Higher vibration modes
+- Materials with low shear modulus (wood)

@@ -1,0 +1,15 @@
+README.md
+pyproject.toml
+idiophone_tuner/__init__.py
+idiophone_tuner/__main__.py
+idiophone_tuner/geometry.py
+idiophone_tuner/main.py
+idiophone_tuner/materials.py
+idiophone_tuner/optimizer.py
+idiophone_tuner/timoshenko.py
+idiophone_tuner.egg-info/PKG-INFO
+idiophone_tuner.egg-info/SOURCES.txt
+idiophone_tuner.egg-info/dependency_links.txt
+idiophone_tuner.egg-info/entry_points.txt
+idiophone_tuner.egg-info/requires.txt
+idiophone_tuner.egg-info/top_level.txt

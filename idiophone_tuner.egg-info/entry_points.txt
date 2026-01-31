@@ -1,0 +1,2 @@
+[console_scripts]
+idiophone-tuner = idiophone_tuner.main:main
