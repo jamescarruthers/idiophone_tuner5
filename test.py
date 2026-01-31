@@ -20,6 +20,6 @@ config = UndercutConfig.xylophone_physics(width_mm=2.0)
 config.max_trim_mm = 20.0
 config.max_extend_mm = 20.0
 
-result = optimize_bar(bar, material, target, config, n_elements=480, verbose=True, callback=my_progress, progress_every=20)
+result = optimize_bar(bar, material, target, config, n_elements=60, verbose=True, callback=my_progress, progress_every=20)
 print(result.summary())
 
