@@ -79,7 +79,8 @@ def frequency_to_note(freq: float) -> tuple[str, float]:
 # =============================================================================
 
 TUNING_RATIOS = {
-    'xylophone': (1.0, 3.0, 6.0),      # Western concert xylophone
+    'xylophone': (1.0, 3.0, 6.0),      # Western concert xylophone (3 modes)
+    'xylophone_4': (1.0, 3.0, 6.0, 10.0),  # 4-mode xylophone
     'marimba': (1.0, 4.0, 10.0),       # Concert marimba
     'vibraphone': (1.0, 4.0, None),    # Mode 3 not tuned
     'glockenspiel': (1.0, 2.76, 5.4),  # Metal bars (close to 1:2.76:5.4)
@@ -123,6 +124,8 @@ class UndercutConfig:
     min_depth_mm: float = 0.0       # Minimum depth
     max_depth_fraction: float = 0.85  # Maximum depth as fraction of thickness
     profile: str = 'flat'           # 'flat' or 'parabolic'
+    max_trim_mm: float = 0.0       # Max amount the bar may be shortened (mm)
+    max_extend_mm: float = 0.0     # Max amount the bar may be lengthened (mm)
     
     @classmethod
     def single_center(cls, width_mm: float = 1.0) -> 'UndercutConfig':
@@ -168,39 +171,55 @@ class UndercutConfig:
     @classmethod
     def xylophone_physics(cls, width_mm: float = 1.0) -> 'UndercutConfig':
         """
-        Physics-optimized positions for xylophone (1:3:6) tuning.
-        
-        Based on mode shape curvature analysis:
-        
-        Mode 1 (fundamental): Max curvature at CENTER (0.5)
-            - Nodes at 0.224, 0.776
-            
-        Mode 2: Max curvature at ~0.25, 0.75 (between its nodes)
-            - Nodes at 0.132, 0.5, 0.868
-            
-        Mode 3: Max curvature at ~0.17, 0.5, 0.83
-            - Nodes at 0.094, 0.356, 0.644, 0.906
-        
-        To RAISE the ratios f2/f1 and f3/f1, we need f1 to drop MORE 
-        than f2 and f3. Strategy:
-        
-        - Heavy cuts at 0.5 (max mode 1 curvature, also mode 3)
-        - Cuts at 0.4, 0.6 (still high mode 1, less mode 2)  
-        - Cuts at 0.3, 0.7 (mode 2 region - use sparingly)
-        - Cuts at 0.2, 0.8 (transition)
-        - Cuts near 0.15, 0.85 (mode 3 curvature, past mode 1 nodes)
-        
-        11 cuts gives good resolution for independent mode control.
+        Physics-optimized positions for 3-mode xylophone (1:3:6) tuning.
+
+        Cuts are placed at mode 1–3 curvature peaks only:
+
+        Mode 1: Antinode at 0.50; nodes at 0.224, 0.776
+        Mode 2: Antinodes at ~0.31, 0.69; nodes at 0.132, 0.5, 0.868
+        Mode 3: Antinodes at ~0.22, 0.50, 0.78; nodes at 0.094, 0.356,
+                 0.644, 0.906
+
+        11 cuts (6 independent with symmetry).
         """
         positions = [
-            0.5,              # Center - affects f1 and f3 strongly
+            0.50,             # Center - f1 and f3 antinode
             0.45, 0.55,       # Near center - strong f1 effect
             0.38, 0.62,       # f1 region, some f2
-            0.30, 0.70,       # f2 curvature region  
-            0.22, 0.78,       # Near f1 nodes - minimal f1 effect, affects f2/f3
+            0.30, 0.70,       # f2 curvature region
+            0.22, 0.78,       # f3 antinode, near f1 nodes
             0.14, 0.86,       # f3 curvature region, past f1 nodes
         ]
-        
+
+        return cls(
+            positions=positions,
+            width_mm=width_mm,
+            max_depth_fraction=0.85
+        )
+
+    @classmethod
+    def xylophone_physics_4mode(cls, width_mm: float = 1.0) -> 'UndercutConfig':
+        """
+        Physics-optimized positions for 4-mode xylophone (1:3:6:10) tuning.
+
+        Extends the 3-mode config with mode 4 antinode positions:
+
+        Mode 4: Antinodes at ~0.175, 0.39, 0.61, 0.825;
+                 nodes at 0.073, 0.277, 0.500, 0.723, 0.927
+
+        15 cuts (8 independent with symmetry).
+        """
+        positions = [
+            0.50,             # Center - f1, f3, f4 antinode
+            0.45, 0.55,       # Near center - strong f1 effect
+            0.39, 0.61,       # f4 antinode (~0.390, 0.610)
+            0.30, 0.70,       # f2 curvature region
+            0.22, 0.78,       # f3 antinode, near f1 nodes
+            0.175, 0.825,     # f4 antinode (~0.175, 0.825)
+            0.14, 0.86,       # f3 curvature region, past f1 nodes
+            0.09, 0.91,       # Near f4 node / f3 outer region
+        ]
+
         return cls(
             positions=positions,
             width_mm=width_mm,
@@ -238,7 +257,8 @@ class OptimizationResult:
     ratio_errors: np.ndarray
     n_iterations: int
     message: str = ""
-    
+    optimized_length_mm: Optional[float] = None
+
     def summary(self) -> str:
         """Generate a human-readable summary."""
         lines = []
@@ -250,7 +270,11 @@ class OptimizationResult:
         if self.message:
             lines.append(f"Message: {self.message}")
         lines.append("")
-        
+
+        if self.optimized_length_mm is not None:
+            lines.append(f"BAR LENGTH: {self.optimized_length_mm:.2f} mm")
+            lines.append("")
+
         lines.append("UNDERCUT DEPTHS:")
         for i, depth in enumerate(self.undercut_depths_mm):
             pos = self.optimized_geometry.undercuts[i].center
@@ -284,11 +308,21 @@ class _FastObjective:
 
     Pre-computes the depth influence matrix and FEM mesh so each evaluation
     is just a matrix-vector product + vectorized eigenvalue solve.
+
+    When *sym_matrix* is provided the optimiser works in a reduced variable
+    space where symmetric cut pairs share a single depth variable.
+
+    When *optimize_length* is True the first element of the input vector is
+    a length offset (metres) and element lengths are scaled accordingly.
     """
 
     def __init__(self, depth_matrix, base_thickness, width, L_e, E, G, rho,
-                 n_modes, target_freqs, weights, ratios):
-        self.depth_matrix = depth_matrix
+                 n_modes, target_freqs, weights, ratios, sym_matrix=None,
+                 optimize_length=False, base_length=None):
+        if sym_matrix is not None:
+            self.depth_matrix = depth_matrix @ sym_matrix
+        else:
+            self.depth_matrix = depth_matrix
         self.base_thickness = base_thickness
         self.width = width
         self.L_e = L_e
@@ -299,8 +333,18 @@ class _FastObjective:
         self.target_freqs = target_freqs
         self.weights = weights
         self.ratios = ratios
+        self.optimize_length = optimize_length
+        self.base_length = base_length
 
-    def __call__(self, depths):
+    def __call__(self, x):
+        if self.optimize_length:
+            length_offset = x[0]
+            depths = x[1:]
+            L_e = self.L_e * ((self.base_length + length_offset) / self.base_length)
+        else:
+            depths = x
+            L_e = self.L_e
+
         h = self.base_thickness - self.depth_matrix @ depths
         np.maximum(h, 1e-6, out=h)
         A = self.width * h
@@ -308,7 +352,7 @@ class _FastObjective:
 
         try:
             freqs = fast_compute_frequencies(
-                self.L_e, self.E, self.G, self.rho, A, I_val, self.n_modes)
+                L_e, self.E, self.G, self.rho, A, I_val, self.n_modes)
         except Exception:
             return 1e10
 
@@ -326,7 +370,109 @@ class _FastObjective:
         return cost
 
 
-def _build_depth_matrix(positions, width_m, profile, bar_length, n_elements):
+def _build_symmetry_map(positions, tol=1e-6):
+    """Identify symmetric position pairs and build a mapping matrix.
+
+    Positions that are mirrors about 0.5 (i.e. ``pos_a + pos_b ≈ 1.0``)
+    are grouped together so they share a single depth variable during
+    optimisation.  This enforces the physical constraint that an idiophone
+    bar's undercuts are symmetric about its centre.
+
+    Returns:
+        sym_matrix: (n_cuts, n_independent) array.
+            ``full_depths = sym_matrix @ independent_depths``
+        groups: list of lists – each inner list contains the cut indices
+            that share one independent variable.
+    """
+    n = len(positions)
+    assigned = [False] * n
+    groups = []
+
+    for i in range(n):
+        if assigned[i]:
+            continue
+        mirror = 1.0 - positions[i]
+        found_partner = False
+        for j in range(i + 1, n):
+            if assigned[j]:
+                continue
+            if abs(positions[j] - mirror) < tol:
+                groups.append([i, j])
+                assigned[i] = True
+                assigned[j] = True
+                found_partner = True
+                break
+        if not found_partner:
+            groups.append([i])
+            assigned[i] = True
+
+    n_independent = len(groups)
+    sym_matrix = np.zeros((n, n_independent))
+    for g_idx, group in enumerate(groups):
+        for cut_idx in group:
+            sym_matrix[cut_idx, g_idx] = 1.0
+
+    return sym_matrix, groups
+
+
+def _build_adaptive_nodes(positions, width_m, bar_length, min_per_cut=8,
+                          max_element_m=0.005):
+    """Build a non-uniform node array that is refined inside undercuts.
+
+    For narrow cuts the FEM needs several elements across each cut to
+    resolve the abrupt thickness change accurately.  Between cuts a
+    coarser mesh is sufficient.
+
+    Args:
+        positions: Cut centre positions as fractions of bar length.
+        width_m: Cut width in metres.
+        bar_length: Bar length in metres.
+        min_per_cut: Minimum number of elements spanning each cut.
+        max_element_m: Maximum element size in coarse regions (metres).
+
+    Returns:
+        1-D array of node positions (metres), sorted and unique.
+    """
+    cut_element = width_m / min_per_cut
+    half_w = width_m / 2.0
+
+    # Collect critical boundaries (cut edges + bar ends).
+    boundaries = {0.0, bar_length}
+    for pos in positions:
+        center = pos * bar_length
+        boundaries.add(max(0.0, center - half_w))
+        boundaries.add(min(bar_length, center + half_w))
+    boundaries = sorted(boundaries)
+
+    # Merge boundaries that are closer together than the fine element size.
+    merged = [boundaries[0]]
+    for b in boundaries[1:]:
+        if b - merged[-1] > cut_element * 0.5:
+            merged.append(b)
+    if merged[-1] != bar_length:
+        merged[-1] = bar_length
+
+    # Subdivide each interval with the appropriate element size.
+    all_nodes = [merged[0]]
+    for i in range(len(merged) - 1):
+        start = merged[i]
+        end = merged[i + 1]
+        span = end - start
+
+        mid = (start + end) / 2.0
+        in_cut = any(abs(mid - p * bar_length) <= half_w + 1e-9
+                     for p in positions)
+
+        target = cut_element if in_cut else max_element_m
+        n_sub = max(1, round(span / target))
+
+        sub_nodes = np.linspace(start, end, n_sub + 1)
+        all_nodes.extend(sub_nodes[1:].tolist())
+
+    return np.array(all_nodes)
+
+
+def _build_depth_matrix(positions, width_m, profile, bar_length, nodes):
     """Build the depth influence matrix for vectorized thickness computation.
 
     Returns an (n_elements, n_cuts) matrix where entry [j, i] gives the
@@ -334,11 +480,14 @@ def _build_depth_matrix(positions, width_m, profile, bar_length, n_elements):
     For flat profiles this is 0 or 1; for shaped profiles it's the
     profile envelope value.
 
+    *nodes* is a 1-D array of FEM node positions (metres) — typically
+    produced by :func:`_build_adaptive_nodes`.
+
     Thickness at any midpoint is: h = base_thickness - depth_matrix @ depths
     """
-    nodes = np.linspace(0, bar_length, n_elements + 1)
-    x_mid = (nodes[:-1] + nodes[1:]) / 2.0  # meters
+    x_mid = (nodes[:-1] + nodes[1:]) / 2.0  # element midpoints
     L_e = np.diff(nodes)
+    n_elements = len(L_e)
     n_cuts = len(positions)
 
     depth_matrix = np.zeros((n_elements, n_cuts))
@@ -376,17 +525,22 @@ def optimize_bar(
     verbose: bool = True,
     progress_every: int = 20,
     callback: Optional[Callable] = None,
-    workers: int = 1
+    workers: int = 1,
+    min_elements_per_cut: int = 8
 ) -> OptimizationResult:
     """
     Optimize undercut depths to achieve target frequencies.
+
+    The FEM mesh is built adaptively: dense elements (at least
+    *min_elements_per_cut*) inside each undercut for accuracy, and
+    coarser elements (governed by *n_elements*) in between.
 
     Args:
         base_geometry: Initial bar geometry (without undercuts)
         material: Material properties
         target: Target frequencies and ratios
         undercut_config: Undercut positions and constraints
-        n_elements: FEM mesh density
+        n_elements: Controls coarse mesh spacing between cuts
         method: 'differential_evolution' (global) or 'SLSQP' (local gradient)
         verbose: Print progress
         progress_every: Print status every N evaluations (0 to disable)
@@ -404,17 +558,41 @@ def optimize_bar(
     # Maximum depth constraint
     max_depth = base_geometry.thickness * undercut_config.max_depth_fraction
 
-    # Bounds for optimization (depths in meters)
-    bounds = [(undercut_config.min_depth_mm / 1000, max_depth) for _ in range(n_cuts)]
+    # Build adaptive FEM mesh: dense inside cuts, coarse between.
+    base_length = base_geometry.length
+    width_m = undercut_config.width_mm / 1000
+    max_element_m = base_length / max(n_elements, 1)
+
+    nodes = _build_adaptive_nodes(
+        undercut_config.positions, width_m, base_length,
+        min_per_cut=min_elements_per_cut,
+        max_element_m=max_element_m
+    )
 
     # Pre-compute depth influence matrix and element lengths
     depth_matrix, L_e = _build_depth_matrix(
         undercut_config.positions,
-        undercut_config.width_mm / 1000,
+        width_m,
         undercut_config.profile,
-        base_geometry.length,
-        n_elements
+        base_length,
+        nodes
     )
+
+    # Enforce symmetric cuts: mirror-pairs share one depth variable.
+    sym_matrix, sym_groups = _build_symmetry_map(undercut_config.positions)
+    effective_depth_matrix = depth_matrix @ sym_matrix
+    n_independent = sym_matrix.shape[1]
+
+    # Length optimisation: optionally prepend a length-offset variable.
+    optimize_length = (undercut_config.max_trim_mm > 0
+                       or undercut_config.max_extend_mm > 0)
+    length_bound = (-undercut_config.max_trim_mm / 1000,
+                    undercut_config.max_extend_mm / 1000)
+
+    # Bounds: [length_offset (optional), depth1, depth2, ...]
+    depth_bounds = [(undercut_config.min_depth_mm / 1000, max_depth)
+                    for _ in range(n_independent)]
+    bounds = ([length_bound] + depth_bounds) if optimize_length else depth_bounds
 
     base_thickness = base_geometry.thickness
     width = base_geometry.width
@@ -428,14 +606,26 @@ def optimize_bar(
     weights = weights / weights.sum()
     target_ratios = np.array(target.ratios[:n_modes])
 
-    def _compute_cost_and_freqs(depths):
-        """Shared cost computation used by both single- and multi-process paths."""
-        h = base_thickness - depth_matrix @ depths
+    def _compute_cost_and_freqs(x):
+        """Shared cost computation used by both single- and multi-process paths.
+
+        *x* is the full optimisation vector: an optional length offset
+        followed by the reduced (independent) depth variables.
+        """
+        if optimize_length:
+            length_offset = x[0]
+            depths = x[1:]
+            cur_L_e = L_e * ((base_length + length_offset) / base_length)
+        else:
+            depths = x
+            cur_L_e = L_e
+
+        h = base_thickness - effective_depth_matrix @ depths
         np.maximum(h, 1e-6, out=h)
         A = width * h
         I_val = width * h ** 3 / 12.0
 
-        freqs = fast_compute_frequencies(L_e, E, G, rho, A, I_val, n_modes)
+        freqs = fast_compute_frequencies(cur_L_e, E, G, rho, A, I_val, n_modes)
         if len(freqs) < n_modes:
             return 1e10, None
 
@@ -453,13 +643,13 @@ def optimize_bar(
     eval_count = [0]
     best_cost = [np.inf]
     best_freqs = [None]
-    best_depths = [None]
+    best_x = [None]
 
-    def objective(depths: np.ndarray) -> float:
+    def objective(x: np.ndarray) -> float:
         eval_count[0] += 1
 
         try:
-            cost, freqs = _compute_cost_and_freqs(depths)
+            cost, freqs = _compute_cost_and_freqs(x)
         except Exception:
             return 1e10
 
@@ -471,7 +661,7 @@ def optimize_bar(
         if is_new_best:
             best_cost[0] = cost
             best_freqs[0] = freqs.copy()
-            best_depths[0] = depths.copy()
+            best_x[0] = x.copy()
 
         show_progress = verbose and progress_every > 0 and (
             is_new_best or eval_count[0] % progress_every == 0
@@ -481,18 +671,36 @@ def optimize_bar(
             ratios = freqs / freqs[0]
             marker = "★ NEW BEST" if is_new_best else ""
 
-            print(f"[{eval_count[0]:4d}] f1={freqs[0]:6.1f}Hz  "
-                  f"ratios=1:{ratios[1]:.2f}:{ratios[2]:.2f}  "
+            length_info = ""
+            if optimize_length:
+                cur_len_mm = (base_length + x[0]) * 1000
+                length_info = f"L={cur_len_mm:.1f}mm  "
+
+            ratio_str = ":".join(f"{r:.2f}" for r in ratios)
+            print(f"[{eval_count[0]:4d}] {length_info}f1={freqs[0]:6.1f}Hz  "
+                  f"ratios={ratio_str}  "
                   f"cost={cost:8.1f}  {marker}")
             sys.stdout.flush()
 
         if is_new_best and callback:
-            callback(eval_count[0], freqs, depths, cost)
+            callback(eval_count[0], freqs, x, cost)
 
         return cost
 
+    n_total_elements = len(L_e)
+    min_elem_mm = L_e.min() * 1000
+    max_elem_mm = L_e.max() * 1000
+
     if verbose:
-        print(f"Optimizing {n_cuts} undercuts for target {target.f1_target:.1f} Hz")
+        print(f"Optimizing {n_cuts} undercuts ({n_independent} independent, "
+              f"{n_cuts - n_independent} symmetric) for target "
+              f"{target.f1_target:.1f} Hz")
+        if optimize_length:
+            print(f"Length optimisation: trim up to {undercut_config.max_trim_mm:.1f} mm, "
+                  f"extend up to {undercut_config.max_extend_mm:.1f} mm  "
+                  f"(base {base_length * 1000:.1f} mm)")
+        print(f"Adaptive mesh: {n_total_elements} elements "
+              f"(element size {min_elem_mm:.2f}–{max_elem_mm:.2f} mm)")
         note, _ = frequency_to_note(target.f1_target)
         print(f"Target note: {note}")
         print(f"Target ratios: {target.ratios}")
@@ -510,7 +718,10 @@ def optimize_bar(
             # Multiprocessing: use picklable objective, deferred updating
             fast_obj = _FastObjective(
                 depth_matrix, base_thickness, width, L_e, E, G, rho,
-                n_modes, target_freqs, weights, target_ratios)
+                n_modes, target_freqs, weights, target_ratios,
+                sym_matrix=sym_matrix,
+                optimize_length=optimize_length,
+                base_length=base_length)
 
             de_gen_count = [0]
 
@@ -521,8 +732,9 @@ def optimize_bar(
                         cost, freqs = _compute_cost_and_freqs(xk)
                         if freqs is not None:
                             ratios = freqs / freqs[0]
+                            ratio_str = ":".join(f"{r:.2f}" for r in ratios)
                             print(f"[gen {de_gen_count[0]:3d}] f1={freqs[0]:6.1f}Hz  "
-                                  f"ratios=1:{ratios[1]:.2f}:{ratios[2]:.2f}  "
+                                  f"ratios={ratio_str}  "
                                   f"cost={cost:8.1f}  conv={convergence:.6f}")
                             sys.stdout.flush()
                     except Exception:
@@ -558,14 +770,15 @@ def optimize_bar(
                 updating='immediate'
             )
 
-        optimal_depths = result.x
+        optimal_result_x = result.x
         success = result.success
         message = result.message
         n_iter = result.nit
 
     elif method == 'SLSQP':
         # Local gradient-based optimizer
-        x0 = np.array([max_depth * 0.3 for _ in range(n_cuts)])
+        x0_depths = [max_depth * 0.3 for _ in range(n_independent)]
+        x0 = np.array(([0.0] + x0_depths) if optimize_length else x0_depths)
         result = minimize(
             objective,
             x0,
@@ -573,7 +786,7 @@ def optimize_bar(
             bounds=bounds,
             options={'maxiter': 500, 'ftol': 1e-6}
         )
-        optimal_depths = result.x
+        optimal_result_x = result.x
         success = result.success
         message = result.message
         n_iter = result.nit
@@ -581,7 +794,26 @@ def optimize_bar(
     else:
         raise ValueError(f"Unknown method: {method}")
 
-    # Build final geometry
+    # Split optimisation result into length offset and independent depths.
+    if optimize_length:
+        optimal_length_offset = optimal_result_x[0]
+        optimal_independent = optimal_result_x[1:]
+        optimized_length = base_length + optimal_length_offset
+    else:
+        optimal_independent = optimal_result_x
+        optimized_length = base_length
+
+    # Expand independent depths back to per-cut depths (symmetric pairs
+    # receive the same value).
+    optimal_depths = sym_matrix @ optimal_independent
+
+    # Build final geometry (with optimised length if applicable)
+    final_bar = BarGeometry(
+        length=optimized_length,
+        width=base_geometry.width,
+        thickness=base_geometry.thickness,
+        undercuts=[]
+    )
     final_undercuts = [
         Undercut(
             center=undercut_config.positions[i],
@@ -591,10 +823,23 @@ def optimize_bar(
         )
         for i in range(n_cuts)
     ]
-    final_geometry = base_geometry.copy_with_undercuts(final_undercuts)
+    final_geometry = final_bar.copy_with_undercuts(final_undercuts)
 
-    # Compute final frequencies
-    final_freqs = compute_frequencies(final_geometry, material, n_elements, n_modes)
+    # Compute final frequencies using an adaptive mesh for accuracy.
+    verify_nodes = _build_adaptive_nodes(
+        undercut_config.positions, width_m, optimized_length,
+        min_per_cut=min_elements_per_cut,
+        max_element_m=max_element_m
+    )
+    verify_L_e = np.diff(verify_nodes)
+    verify_mid = (verify_nodes[:-1] + verify_nodes[1:]) / 2.0
+    verify_mid_rel = verify_mid / optimized_length
+    verify_h = np.array([final_geometry.thickness_at(xr) for xr in verify_mid_rel])
+    verify_A = base_geometry.width * verify_h
+    verify_I = base_geometry.width * verify_h ** 3 / 12.0
+    final_freqs = fast_compute_frequencies(
+        verify_L_e, E, G, rho, verify_A, verify_I, n_modes
+    )
     target_freqs_arr = target.target_frequencies
 
     # Compute errors
@@ -612,8 +857,184 @@ def optimize_bar(
         frequency_errors_cents=cents_errors,
         ratio_errors=ratio_errors,
         n_iterations=n_iter,
-        message=message
+        message=message,
+        optimized_length_mm=optimized_length * 1000 if optimize_length else None
     )
+
+
+def compute_tuning_guide(
+    result: OptimizationResult,
+    base_geometry: BarGeometry,
+    material: Material,
+    undercut_config: UndercutConfig,
+    n_elements: int = 60,
+    min_elements_per_cut: int = 8,
+    delta_mm: float = 0.1,
+) -> str:
+    """Compute a practical tuning guide for hand-finishing an optimised bar.
+
+    For each independent cut (symmetric pairs grouped), this perturbs the
+    depth by *delta_mm* and reports the resulting cents change for every mode.
+    This tells the maker which cuts to deepen (or leave shy) to nudge each
+    frequency in the desired direction.
+
+    Args:
+        result: A completed :class:`OptimizationResult`.
+        base_geometry: The original bar geometry (pre-optimisation).
+        material: Material properties.
+        undercut_config: The undercut config used during optimisation.
+        n_elements: Coarse mesh parameter (same as in optimise call).
+        min_elements_per_cut: Fine mesh elements per cut.
+        delta_mm: Perturbation size in mm for sensitivity calculation.
+
+    Returns:
+        A formatted multi-line string ready for printing.
+    """
+    n_cuts = len(undercut_config.positions)
+    n_modes = len(result.achieved_frequencies)
+
+    # Recover optimised bar length.
+    if result.optimized_length_mm is not None:
+        bar_length = result.optimized_length_mm / 1000
+    else:
+        bar_length = base_geometry.length
+
+    width_m = undercut_config.width_mm / 1000
+    max_element_m = bar_length / max(n_elements, 1)
+
+    # Build FEM mesh at the optimised length.
+    nodes = _build_adaptive_nodes(
+        undercut_config.positions, width_m, bar_length,
+        min_per_cut=min_elements_per_cut,
+        max_element_m=max_element_m,
+    )
+    depth_matrix, L_e = _build_depth_matrix(
+        undercut_config.positions, width_m,
+        undercut_config.profile, bar_length, nodes,
+    )
+    sym_matrix, sym_groups = _build_symmetry_map(undercut_config.positions)
+
+    base_thickness = base_geometry.thickness
+    bar_width = base_geometry.width
+    E, G, rho = material.E, material.G, material.rho
+
+    # Optimal depths per cut (metres).
+    optimal_depths = result.undercut_depths_mm / 1000
+
+    def _freqs_at(depths_m):
+        """Compute modal frequencies for a given depth vector."""
+        h = base_thickness - depth_matrix @ depths_m
+        np.maximum(h, 1e-6, out=h)
+        A = bar_width * h
+        I_val = bar_width * h ** 3 / 12.0
+        return fast_compute_frequencies(L_e, E, G, rho, A, I_val, n_modes)
+
+    # Reference frequencies at the optimised state.
+    f_ref = _freqs_at(optimal_depths)
+
+    # Sensitivity: cents change per mm of additional depth for each group.
+    delta_m = delta_mm / 1000
+    sensitivities = []  # list of arrays, one per group
+
+    for g_idx, group in enumerate(sym_groups):
+        perturbed = optimal_depths.copy()
+        for cut_idx in group:
+            perturbed[cut_idx] += delta_m
+        f_pert = _freqs_at(perturbed)
+
+        # cents change per mm
+        cents_per_mm = 1200.0 * np.log2(f_pert / f_ref) / delta_mm
+        sensitivities.append(cents_per_mm)
+
+    # Also compute length sensitivity if length was optimised.
+    length_sens = None
+    if result.optimized_length_mm is not None:
+        len_delta_mm = 0.5
+        len_delta_m = len_delta_mm / 1000
+        longer_length = bar_length + len_delta_m
+        nodes_l = _build_adaptive_nodes(
+            undercut_config.positions, width_m, longer_length,
+            min_per_cut=min_elements_per_cut,
+            max_element_m=max_element_m,
+        )
+        dm_l, Le_l = _build_depth_matrix(
+            undercut_config.positions, width_m,
+            undercut_config.profile, longer_length, nodes_l,
+        )
+        h_l = base_thickness - dm_l @ optimal_depths
+        np.maximum(h_l, 1e-6, out=h_l)
+        A_l = bar_width * h_l
+        I_l = bar_width * h_l ** 3 / 12.0
+        f_longer = fast_compute_frequencies(Le_l, E, G, rho, A_l, I_l, n_modes)
+        length_sens = 1200.0 * np.log2(f_longer / f_ref) / len_delta_mm
+
+    # --- Format the guide ---
+    lines = []
+    lines.append("=" * 70)
+    lines.append("TUNING GUIDE")
+    lines.append("=" * 70)
+    lines.append("")
+    lines.append("Sensitivity: cents change per 1 mm deeper cut (negative = pitch drops)")
+    lines.append("Start ~2 mm shy of target depth, then deepen to tune.")
+    lines.append("")
+
+    # Header
+    mode_hdrs = [f"{'Mode '+str(i+1):>8s}" for i in range(n_modes)]
+    hdr = f"  {'Cut':20s} {'Depth':>7s}  " + "  ".join(mode_hdrs)
+    lines.append(hdr)
+    lines.append("  " + "-" * (len(hdr) - 2))
+
+    for g_idx, group in enumerate(sym_groups):
+        positions = [undercut_config.positions[i] for i in group]
+        depth_mm = result.undercut_depths_mm[group[0]]
+
+        if len(group) == 1:
+            label = f"{positions[0]:.1%} (centre)"
+        else:
+            label = f"{positions[0]:.1%} + {positions[1]:.1%}"
+
+        sens = sensitivities[g_idx]
+        vals = "  ".join(f"{s:+8.1f}" for s in sens)
+        lines.append(f"  {label:20s} {depth_mm:6.1f}mm  {vals}")
+
+    if length_sens is not None:
+        lines.append("")
+        vals = "  ".join(f"{s:+8.1f}" for s in length_sens)
+        lines.append(f"  {'Bar length':20s} {result.optimized_length_mm:6.1f}mm  {vals}")
+        lines.append(f"  {'':20s} {'':>7s}  (cents per 1 mm longer)")
+
+    # --- Practical advice section ---
+    lines.append("")
+    lines.append("-" * 70)
+    lines.append("HOW TO USE")
+    lines.append("-" * 70)
+    lines.append("")
+
+    # For each mode, find the most influential cut.
+    for m in range(n_modes):
+        best_g = max(range(len(sym_groups)),
+                     key=lambda g: abs(sensitivities[g][m]))
+        group = sym_groups[best_g]
+        positions = [undercut_config.positions[i] for i in group]
+        s = sensitivities[best_g][m]
+
+        if len(group) == 1:
+            cut_label = f"centre cut ({positions[0]:.0%})"
+        else:
+            cut_label = f"cuts at {positions[0]:.0%}/{positions[1]:.0%}"
+
+        direction = "drops" if s < 0 else "rises"
+        lines.append(f"  Mode {m+1}: Most sensitive to {cut_label} "
+                     f"({s:+.1f} ¢/mm — pitch {direction})")
+
+    if length_sens is not None:
+        lines.append("")
+        lines.append("  Trimming the bar (shorter) raises all pitches; "
+                     "all modes scale roughly together.")
+
+    lines.append("")
+    lines.append("=" * 70)
+    return "\n".join(lines)
 
 
 def find_initial_length(
