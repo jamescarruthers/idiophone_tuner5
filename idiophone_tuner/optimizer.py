@@ -126,6 +126,10 @@ class UndercutConfig:
     profile: str = 'flat'           # 'flat' or 'parabolic'
     max_trim_mm: float = 0.0       # Max amount the bar may be shortened (mm)
     max_extend_mm: float = 0.0     # Max amount the bar may be lengthened (mm)
+    depth_penalty_weight: float = 0.0       # Soft penalty on individual cut depths
+    length_penalty_weight: float = 0.0      # Soft penalty on bar length changes
+    total_depth_penalty_weight: float = 0.0 # Soft penalty on aggregate cut depth
+    max_total_depth_mm: Optional[float] = None  # Hard limit on sum of all cut depths (mm)
     
     @classmethod
     def single_center(cls, width_mm: float = 1.0) -> 'UndercutConfig':
@@ -281,6 +285,11 @@ class OptimizationResult:
             pos = self.optimized_geometry.undercuts[i].center
             pos_mm = pos * bar_length_mm
             lines.append(f"  Cut {i+1} at {pos:.1%} ({pos_mm:.1f} mm): {depth:.2f} mm")
+        total_depth = np.sum(self.undercut_depths_mm)
+        max_depth = np.max(self.undercut_depths_mm)
+        lines.append(f"  ---")
+        lines.append(f"  Total cut depth: {total_depth:.1f} mm  "
+                     f"(deepest: {max_depth:.2f} mm)")
         lines.append("")
         
         lines.append("FREQUENCIES:")
@@ -320,11 +329,14 @@ class _FastObjective:
 
     def __init__(self, depth_matrix, base_thickness, width, L_e, E, G, rho,
                  n_modes, target_freqs, weights, ratios, sym_matrix=None,
-                 optimize_length=False, base_length=None):
+                 optimize_length=False, base_length=None,
+                 depth_penalty_weight=0.0, length_penalty_weight=0.0,
+                 total_depth_penalty_weight=0.0, max_total_depth_mm=None):
         if sym_matrix is not None:
             self.depth_matrix = depth_matrix @ sym_matrix
         else:
             self.depth_matrix = depth_matrix
+        self.sym_matrix = sym_matrix
         self.base_thickness = base_thickness
         self.width = width
         self.L_e = L_e
@@ -337,6 +349,10 @@ class _FastObjective:
         self.ratios = ratios
         self.optimize_length = optimize_length
         self.base_length = base_length
+        self.depth_penalty_weight = depth_penalty_weight
+        self.length_penalty_weight = length_penalty_weight
+        self.total_depth_penalty_weight = total_depth_penalty_weight
+        self.max_total_depth_mm = max_total_depth_mm
 
     def __call__(self, x):
         if self.optimize_length:
@@ -344,6 +360,7 @@ class _FastObjective:
             depths = x[1:]
             L_e = self.L_e * ((self.base_length + length_offset) / self.base_length)
         else:
+            length_offset = 0.0
             depths = x
             L_e = self.L_e
 
@@ -368,6 +385,31 @@ class _FastObjective:
             achieved_ratios = freqs / freqs[0]
             ratio_errors = (achieved_ratios - self.ratios) / self.ratios
             cost += 100.0 * np.sum(ratio_errors[1:] ** 2)
+
+        # --- Penalty terms ---
+        # Expand independent depths to full (per-cut) depths for penalties.
+        if self.sym_matrix is not None:
+            full_depths = self.sym_matrix @ depths
+        else:
+            full_depths = depths
+
+        if self.depth_penalty_weight > 0:
+            full_depths_mm = full_depths * 1000
+            cost += self.depth_penalty_weight * np.sum(full_depths_mm ** 2)
+
+        if self.total_depth_penalty_weight > 0:
+            total_mm = np.sum(full_depths) * 1000
+            cost += self.total_depth_penalty_weight * total_mm ** 2
+
+        if self.length_penalty_weight > 0 and self.optimize_length:
+            trim_mm = length_offset * 1000
+            cost += self.length_penalty_weight * trim_mm ** 2
+
+        if self.max_total_depth_mm is not None:
+            total_mm = np.sum(full_depths) * 1000
+            excess = total_mm - self.max_total_depth_mm
+            if excess > 0:
+                cost += 1e6 * excess ** 2
 
         return cost
 
@@ -611,6 +653,12 @@ def optimize_bar(
     weights = weights / weights.sum()
     target_ratios = np.array(target.ratios[:n_modes])
 
+    # Penalty config (captured in closures below).
+    dpw = undercut_config.depth_penalty_weight
+    lpw = undercut_config.length_penalty_weight
+    tdpw = undercut_config.total_depth_penalty_weight
+    mtd = undercut_config.max_total_depth_mm
+
     def _compute_cost_and_freqs(x):
         """Shared cost computation used by both single- and multi-process paths.
 
@@ -622,6 +670,7 @@ def optimize_bar(
             depths = x[1:]
             cur_L_e = L_e * ((base_length + length_offset) / base_length)
         else:
+            length_offset = 0.0
             depths = x
             cur_L_e = L_e
 
@@ -641,6 +690,27 @@ def optimize_bar(
             achieved_ratios = freqs / freqs[0]
             ratio_errors = (achieved_ratios - target_ratios) / target_ratios
             cost += 100.0 * np.sum(ratio_errors[1:] ** 2)
+
+        # --- Penalty terms ---
+        full_depths = sym_matrix @ depths
+
+        if dpw > 0:
+            full_depths_mm = full_depths * 1000
+            cost += dpw * np.sum(full_depths_mm ** 2)
+
+        if tdpw > 0:
+            total_mm = np.sum(full_depths) * 1000
+            cost += tdpw * total_mm ** 2
+
+        if lpw > 0 and optimize_length:
+            trim_mm = length_offset * 1000
+            cost += lpw * trim_mm ** 2
+
+        if mtd is not None:
+            total_mm = np.sum(full_depths) * 1000
+            excess = total_mm - mtd
+            if excess > 0:
+                cost += 1e6 * excess ** 2
 
         return cost, freqs
 
@@ -722,6 +792,17 @@ def optimize_bar(
             import os
             n_cpus = os.cpu_count() if workers == -1 else workers
             print(f"Using {n_cpus} parallel workers")
+        penalties = []
+        if dpw > 0:
+            penalties.append(f"depth={dpw}")
+        if lpw > 0:
+            penalties.append(f"length={lpw}")
+        if tdpw > 0:
+            penalties.append(f"total_depth={tdpw}")
+        if mtd is not None:
+            penalties.append(f"max_total_depth={mtd:.1f}mm")
+        if penalties:
+            print(f"Penalties: {', '.join(penalties)}")
         print("")
 
     # When convergence_cents is set, disable DE's built-in population
@@ -739,7 +820,11 @@ def optimize_bar(
                 n_modes, target_freqs, weights, target_ratios,
                 sym_matrix=sym_matrix,
                 optimize_length=optimize_length,
-                base_length=base_length)
+                base_length=base_length,
+                depth_penalty_weight=dpw,
+                length_penalty_weight=lpw,
+                total_depth_penalty_weight=tdpw,
+                max_total_depth_mm=mtd)
 
             de_gen_count = [0]
 
