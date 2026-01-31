@@ -862,6 +862,181 @@ def optimize_bar(
     )
 
 
+def compute_tuning_guide(
+    result: OptimizationResult,
+    base_geometry: BarGeometry,
+    material: Material,
+    undercut_config: UndercutConfig,
+    n_elements: int = 60,
+    min_elements_per_cut: int = 8,
+    delta_mm: float = 0.1,
+) -> str:
+    """Compute a practical tuning guide for hand-finishing an optimised bar.
+
+    For each independent cut (symmetric pairs grouped), this perturbs the
+    depth by *delta_mm* and reports the resulting cents change for every mode.
+    This tells the maker which cuts to deepen (or leave shy) to nudge each
+    frequency in the desired direction.
+
+    Args:
+        result: A completed :class:`OptimizationResult`.
+        base_geometry: The original bar geometry (pre-optimisation).
+        material: Material properties.
+        undercut_config: The undercut config used during optimisation.
+        n_elements: Coarse mesh parameter (same as in optimise call).
+        min_elements_per_cut: Fine mesh elements per cut.
+        delta_mm: Perturbation size in mm for sensitivity calculation.
+
+    Returns:
+        A formatted multi-line string ready for printing.
+    """
+    n_cuts = len(undercut_config.positions)
+    n_modes = len(result.achieved_frequencies)
+
+    # Recover optimised bar length.
+    if result.optimized_length_mm is not None:
+        bar_length = result.optimized_length_mm / 1000
+    else:
+        bar_length = base_geometry.length
+
+    width_m = undercut_config.width_mm / 1000
+    max_element_m = bar_length / max(n_elements, 1)
+
+    # Build FEM mesh at the optimised length.
+    nodes = _build_adaptive_nodes(
+        undercut_config.positions, width_m, bar_length,
+        min_per_cut=min_elements_per_cut,
+        max_element_m=max_element_m,
+    )
+    depth_matrix, L_e = _build_depth_matrix(
+        undercut_config.positions, width_m,
+        undercut_config.profile, bar_length, nodes,
+    )
+    sym_matrix, sym_groups = _build_symmetry_map(undercut_config.positions)
+
+    base_thickness = base_geometry.thickness
+    bar_width = base_geometry.width
+    E, G, rho = material.E, material.G, material.rho
+
+    # Optimal depths per cut (metres).
+    optimal_depths = result.undercut_depths_mm / 1000
+
+    def _freqs_at(depths_m):
+        """Compute modal frequencies for a given depth vector."""
+        h = base_thickness - depth_matrix @ depths_m
+        np.maximum(h, 1e-6, out=h)
+        A = bar_width * h
+        I_val = bar_width * h ** 3 / 12.0
+        return fast_compute_frequencies(L_e, E, G, rho, A, I_val, n_modes)
+
+    # Reference frequencies at the optimised state.
+    f_ref = _freqs_at(optimal_depths)
+
+    # Sensitivity: cents change per mm of additional depth for each group.
+    delta_m = delta_mm / 1000
+    sensitivities = []  # list of arrays, one per group
+
+    for g_idx, group in enumerate(sym_groups):
+        perturbed = optimal_depths.copy()
+        for cut_idx in group:
+            perturbed[cut_idx] += delta_m
+        f_pert = _freqs_at(perturbed)
+
+        # cents change per mm
+        cents_per_mm = 1200.0 * np.log2(f_pert / f_ref) / delta_mm
+        sensitivities.append(cents_per_mm)
+
+    # Also compute length sensitivity if length was optimised.
+    length_sens = None
+    if result.optimized_length_mm is not None:
+        len_delta_mm = 0.5
+        len_delta_m = len_delta_mm / 1000
+        longer_length = bar_length + len_delta_m
+        nodes_l = _build_adaptive_nodes(
+            undercut_config.positions, width_m, longer_length,
+            min_per_cut=min_elements_per_cut,
+            max_element_m=max_element_m,
+        )
+        dm_l, Le_l = _build_depth_matrix(
+            undercut_config.positions, width_m,
+            undercut_config.profile, longer_length, nodes_l,
+        )
+        h_l = base_thickness - dm_l @ optimal_depths
+        np.maximum(h_l, 1e-6, out=h_l)
+        A_l = bar_width * h_l
+        I_l = bar_width * h_l ** 3 / 12.0
+        f_longer = fast_compute_frequencies(Le_l, E, G, rho, A_l, I_l, n_modes)
+        length_sens = 1200.0 * np.log2(f_longer / f_ref) / len_delta_mm
+
+    # --- Format the guide ---
+    lines = []
+    lines.append("=" * 70)
+    lines.append("TUNING GUIDE")
+    lines.append("=" * 70)
+    lines.append("")
+    lines.append("Sensitivity: cents change per 1 mm deeper cut (negative = pitch drops)")
+    lines.append("Start ~2 mm shy of target depth, then deepen to tune.")
+    lines.append("")
+
+    # Header
+    mode_hdrs = [f"{'Mode '+str(i+1):>8s}" for i in range(n_modes)]
+    hdr = f"  {'Cut':20s} {'Depth':>7s}  " + "  ".join(mode_hdrs)
+    lines.append(hdr)
+    lines.append("  " + "-" * (len(hdr) - 2))
+
+    for g_idx, group in enumerate(sym_groups):
+        positions = [undercut_config.positions[i] for i in group]
+        depth_mm = result.undercut_depths_mm[group[0]]
+
+        if len(group) == 1:
+            label = f"{positions[0]:.1%} (centre)"
+        else:
+            label = f"{positions[0]:.1%} + {positions[1]:.1%}"
+
+        sens = sensitivities[g_idx]
+        vals = "  ".join(f"{s:+8.1f}" for s in sens)
+        lines.append(f"  {label:20s} {depth_mm:6.1f}mm  {vals}")
+
+    if length_sens is not None:
+        lines.append("")
+        vals = "  ".join(f"{s:+8.1f}" for s in length_sens)
+        lines.append(f"  {'Bar length':20s} {result.optimized_length_mm:6.1f}mm  {vals}")
+        lines.append(f"  {'':20s} {'':>7s}  (cents per 1 mm longer)")
+
+    # --- Practical advice section ---
+    lines.append("")
+    lines.append("-" * 70)
+    lines.append("HOW TO USE")
+    lines.append("-" * 70)
+    lines.append("")
+
+    # For each mode, find the most influential cut.
+    for m in range(n_modes):
+        best_g = max(range(len(sym_groups)),
+                     key=lambda g: abs(sensitivities[g][m]))
+        group = sym_groups[best_g]
+        positions = [undercut_config.positions[i] for i in group]
+        s = sensitivities[best_g][m]
+
+        if len(group) == 1:
+            cut_label = f"centre cut ({positions[0]:.0%})"
+        else:
+            cut_label = f"cuts at {positions[0]:.0%}/{positions[1]:.0%}"
+
+        direction = "drops" if s < 0 else "rises"
+        lines.append(f"  Mode {m+1}: Most sensitive to {cut_label} "
+                     f"({s:+.1f} ¢/mm — pitch {direction})")
+
+    if length_sens is not None:
+        lines.append("")
+        lines.append("  Trimming the bar (shorter) raises all pitches; "
+                     "all modes scale roughly together.")
+
+    lines.append("")
+    lines.append("=" * 70)
+    return "\n".join(lines)
+
+
 def find_initial_length(
     width_mm: float,
     thickness_mm: float,
