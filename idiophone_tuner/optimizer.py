@@ -284,11 +284,19 @@ class _FastObjective:
 
     Pre-computes the depth influence matrix and FEM mesh so each evaluation
     is just a matrix-vector product + vectorized eigenvalue solve.
+
+    When *sym_matrix* is provided the optimiser works in a reduced variable
+    space where symmetric cut pairs share a single depth variable.
+    ``effective_depth_matrix = depth_matrix @ sym_matrix`` so the input
+    vector has length ``n_independent`` rather than ``n_cuts``.
     """
 
     def __init__(self, depth_matrix, base_thickness, width, L_e, E, G, rho,
-                 n_modes, target_freqs, weights, ratios):
-        self.depth_matrix = depth_matrix
+                 n_modes, target_freqs, weights, ratios, sym_matrix=None):
+        if sym_matrix is not None:
+            self.depth_matrix = depth_matrix @ sym_matrix
+        else:
+            self.depth_matrix = depth_matrix
         self.base_thickness = base_thickness
         self.width = width
         self.L_e = L_e
@@ -324,6 +332,51 @@ class _FastObjective:
             cost += 100.0 * np.sum(ratio_errors[1:] ** 2)
 
         return cost
+
+
+def _build_symmetry_map(positions, tol=1e-6):
+    """Identify symmetric position pairs and build a mapping matrix.
+
+    Positions that are mirrors about 0.5 (i.e. ``pos_a + pos_b ≈ 1.0``)
+    are grouped together so they share a single depth variable during
+    optimisation.  This enforces the physical constraint that an idiophone
+    bar's undercuts are symmetric about its centre.
+
+    Returns:
+        sym_matrix: (n_cuts, n_independent) array.
+            ``full_depths = sym_matrix @ independent_depths``
+        groups: list of lists – each inner list contains the cut indices
+            that share one independent variable.
+    """
+    n = len(positions)
+    assigned = [False] * n
+    groups = []
+
+    for i in range(n):
+        if assigned[i]:
+            continue
+        mirror = 1.0 - positions[i]
+        found_partner = False
+        for j in range(i + 1, n):
+            if assigned[j]:
+                continue
+            if abs(positions[j] - mirror) < tol:
+                groups.append([i, j])
+                assigned[i] = True
+                assigned[j] = True
+                found_partner = True
+                break
+        if not found_partner:
+            groups.append([i])
+            assigned[i] = True
+
+    n_independent = len(groups)
+    sym_matrix = np.zeros((n, n_independent))
+    for g_idx, group in enumerate(groups):
+        for cut_idx in group:
+            sym_matrix[cut_idx, g_idx] = 1.0
+
+    return sym_matrix, groups
 
 
 def _build_depth_matrix(positions, width_m, profile, bar_length, n_elements):
@@ -404,9 +457,6 @@ def optimize_bar(
     # Maximum depth constraint
     max_depth = base_geometry.thickness * undercut_config.max_depth_fraction
 
-    # Bounds for optimization (depths in meters)
-    bounds = [(undercut_config.min_depth_mm / 1000, max_depth) for _ in range(n_cuts)]
-
     # Pre-compute depth influence matrix and element lengths
     depth_matrix, L_e = _build_depth_matrix(
         undercut_config.positions,
@@ -415,6 +465,15 @@ def optimize_bar(
         base_geometry.length,
         n_elements
     )
+
+    # Enforce symmetric cuts: mirror-pairs share one depth variable.
+    sym_matrix, sym_groups = _build_symmetry_map(undercut_config.positions)
+    effective_depth_matrix = depth_matrix @ sym_matrix
+    n_independent = sym_matrix.shape[1]
+
+    # Bounds for optimization – one per independent variable (meters)
+    bounds = [(undercut_config.min_depth_mm / 1000, max_depth)
+              for _ in range(n_independent)]
 
     base_thickness = base_geometry.thickness
     width = base_geometry.width
@@ -429,8 +488,11 @@ def optimize_bar(
     target_ratios = np.array(target.ratios[:n_modes])
 
     def _compute_cost_and_freqs(depths):
-        """Shared cost computation used by both single- and multi-process paths."""
-        h = base_thickness - depth_matrix @ depths
+        """Shared cost computation used by both single- and multi-process paths.
+
+        *depths* is in the reduced (independent) variable space.
+        """
+        h = base_thickness - effective_depth_matrix @ depths
         np.maximum(h, 1e-6, out=h)
         A = width * h
         I_val = width * h ** 3 / 12.0
@@ -492,7 +554,9 @@ def optimize_bar(
         return cost
 
     if verbose:
-        print(f"Optimizing {n_cuts} undercuts for target {target.f1_target:.1f} Hz")
+        print(f"Optimizing {n_cuts} undercuts ({n_independent} independent, "
+              f"{n_cuts - n_independent} symmetric) for target "
+              f"{target.f1_target:.1f} Hz")
         note, _ = frequency_to_note(target.f1_target)
         print(f"Target note: {note}")
         print(f"Target ratios: {target.ratios}")
@@ -510,7 +574,8 @@ def optimize_bar(
             # Multiprocessing: use picklable objective, deferred updating
             fast_obj = _FastObjective(
                 depth_matrix, base_thickness, width, L_e, E, G, rho,
-                n_modes, target_freqs, weights, target_ratios)
+                n_modes, target_freqs, weights, target_ratios,
+                sym_matrix=sym_matrix)
 
             de_gen_count = [0]
 
@@ -558,14 +623,14 @@ def optimize_bar(
                 updating='immediate'
             )
 
-        optimal_depths = result.x
+        optimal_independent = result.x
         success = result.success
         message = result.message
         n_iter = result.nit
 
     elif method == 'SLSQP':
         # Local gradient-based optimizer
-        x0 = np.array([max_depth * 0.3 for _ in range(n_cuts)])
+        x0 = np.array([max_depth * 0.3 for _ in range(n_independent)])
         result = minimize(
             objective,
             x0,
@@ -573,13 +638,17 @@ def optimize_bar(
             bounds=bounds,
             options={'maxiter': 500, 'ftol': 1e-6}
         )
-        optimal_depths = result.x
+        optimal_independent = result.x
         success = result.success
         message = result.message
         n_iter = result.nit
 
     else:
         raise ValueError(f"Unknown method: {method}")
+
+    # Expand independent depths back to per-cut depths (symmetric pairs
+    # receive the same value).
+    optimal_depths = sym_matrix @ optimal_independent
 
     # Build final geometry
     final_undercuts = [
