@@ -76,8 +76,12 @@ target = TuningTarget.from_note(
 # =========================================================================
 # Undercut configuration
 # =========================================================================
-# Cut positions are computed automatically from free-free beam curvature
-# peaks — the locations where material removal has the greatest effect.
+# Cut positions are computed automatically from beam curvature peaks —
+# the locations where material removal has the greatest effect.
+# Pass bar & material for Timoshenko FEM peaks (accounts for shear);
+# omit them for universal Euler-Bernoulli positions.
+# n_modes focuses the ranking on the modes you're actually tuning.
+#
 # Just choose the number of cuts (must be odd):
 #   .from_n_cuts(5)       3 independent — good for 2-3 modes
 #   .from_n_cuts(7)       4 independent — good for 3 modes
@@ -86,7 +90,9 @@ target = TuningTarget.from_note(
 #   .from_n_cuts(13)      7 independent — good for 5-6 modes
 #   .from_n_cuts(15)      8 independent — good for 6-7 modes
 
-config = UndercutConfig.from_n_cuts(5, width_mm=1.0)
+config = UndercutConfig.from_n_cuts(7, width_mm=1.0,
+                                    bar=bar, material=material,
+                                    n_modes=len(target.ratios))
 
 # --- Cut depth constraints ---
 config.min_depth_mm       = 0.0    # Floor: minimum cut depth (mm)

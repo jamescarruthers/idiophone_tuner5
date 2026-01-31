@@ -133,59 +133,155 @@ _FREE_FREE_BETA_L = [
 ]
 
 
-def _free_free_curvature_peaks(n_modes=8, merge_tol=0.02):
-    """Interior curvature-peak positions for a uniform free-free beam.
+def _free_free_curvature_peaks(n_modes=8, merge_tol=0.03):
+    """Optimal cut positions derived from free-free beam curvature.
 
-    For each of the first *n_modes* vibration modes, computes positions
-    (as fractions of bar length) where the bending-moment magnitude
-    |φ''(x)| reaches a local maximum.  These are the locations where
-    material removal has the greatest effect on each mode's frequency.
+    For each of the first 8 vibration modes, finds the interior
+    positions where |φ''(x)| peaks (the bending-curvature maxima).
+    These are physically meaningful positions where material removal has
+    the greatest effect on that mode's frequency.
 
-    Returns a flat list ordered by mode priority: centre (0.5) first,
-    then pairs from mode 2, mode 3, etc.  Symmetric pairs are
-    consecutive (lo, hi).  Peaks within *merge_tol* of an already-
-    selected position are skipped.
+    Positions are then ranked by a *composite effectiveness score*: the
+    sum of normalised curvature magnitudes across modes, weighted by
+    1/mode_number.  *n_modes* controls how many modes contribute to
+    the score — lower values focus positions on the modes being tuned.
+    Peaks from all 8 modes are always used as candidates so that enough
+    positions are available even when *n_modes* is small.
+
+    Returns a flat list: centre (0.5) first, then symmetric pairs
+    (lo, hi) in decreasing order of composite score.  Peaks within
+    *merge_tol* of an already-selected one are skipped.
     """
     xi = np.linspace(0, 1, 10001)
-    result = [0.5]
-    seen = {0.5}
 
-    for m in range(min(n_modes, len(_FREE_FREE_BETA_L))):
+    # Always compute curvature for all 8 modes (for candidate positions).
+    n_all = len(_FREE_FREE_BETA_L)
+    mode_curvatures = []
+    for m in range(n_all):
         bL = _FREE_FREE_BETA_L[m]
         s = (np.cosh(bL) - np.cos(bL)) / (np.sinh(bL) - np.sin(bL))
-
-        # |Curvature| ∝ |cosh(bLξ) - cos(bLξ) - σ(sinh(bLξ) - sin(bLξ))|
         curv = np.abs(
             np.cosh(bL * xi) - np.cos(bL * xi)
             - s * (np.sinh(bL * xi) - np.sin(bL * xi))
         )
+        curv /= curv.max()                 # normalise to 0-1
+        mode_curvatures.append(curv)
 
-        # Collect interior local maxima (exclude outer 8%).
-        mode_peaks = []
+    # Composite score uses only the first n_modes for ranking.
+    composite = np.zeros_like(xi)
+    for m in range(min(n_modes, n_all)):
+        composite += mode_curvatures[m] / (m + 1)
+
+    # Collect *individual mode* curvature peaks from ALL modes (interior,
+    # 8–92%).  Each candidate is scored by its composite effectiveness
+    # (which only weights the first n_modes).
+    candidates = []
+    for curv in mode_curvatures:
         for i in range(1, len(curv) - 1):
             if curv[i] > curv[i - 1] and curv[i] > curv[i + 1]:
                 p = xi[i]
                 if 0.08 < p < 0.92:
-                    mode_peaks.append((p, curv[i]))
+                    candidates.append((p, composite[i]))
 
-        # Strongest peaks first within this mode.
-        mode_peaks.sort(key=lambda t: -t[1])
+    # Highest composite score first.
+    candidates.sort(key=lambda t: -t[1])
 
-        for pos, _ in mode_peaks:
-            pos = round(pos, 3)
-            if abs(pos - 0.5) < 0.015:
-                continue  # centre already included
-            mirror = round(1.0 - pos, 3)
-            lo, hi = min(pos, mirror), max(pos, mirror)
+    # Select positions: centre first, then pairs by composite score.
+    result = [0.5]
+    seen = {0.5}
 
-            # Skip if too close to an existing position.
-            if any(abs(lo - s) < merge_tol for s in seen):
-                continue
+    for pos, _ in candidates:
+        pos = round(pos, 3)
+        if abs(pos - 0.5) < 0.015:
+            continue  # centre already included
+        mirror = round(1.0 - pos, 3)
+        lo, hi = min(pos, mirror), max(pos, mirror)
 
-            seen.update([lo, hi])
-            result.extend([lo, hi])
+        # Skip if too close to an existing position.
+        if any(abs(lo - s) < merge_tol for s in seen):
+            continue
+
+        seen.update([lo, hi])
+        result.extend([lo, hi])
 
     return result
+
+
+def _timoshenko_curvature_peaks(bar, material, n_modes=8, merge_tol=0.03):
+    """Optimal cut positions from Timoshenko FEM curvature peaks.
+
+    Runs a modal analysis on the uniform (uncut) bar and computes bending
+    curvature κ = dψ/dx from the rotation DOFs.  Peak positions are ranked
+    by a composite effectiveness score exactly as in
+    ``_free_free_curvature_peaks``, but using the actual Timoshenko mode
+    shapes which account for shear deformation and rotary inertia.
+
+    For materials with a high E/G ratio (wood ≈ 14) the higher-mode
+    curvature peaks shift noticeably compared to Euler-Bernoulli theory.
+
+    All available modes (up to 8) are used to find candidate positions;
+    *n_modes* controls how many modes contribute to the composite score
+    that ranks them.
+    """
+    from .timoshenko import modal_analysis as _modal_analysis
+
+    # Run FEM on the uniform bar (no undercuts).
+    n_all = 8
+    n_elem = 200  # fine enough for smooth curvature
+    result = _modal_analysis(bar, material, n_elements=n_elem,
+                             n_modes=n_all + 2)  # extra margin for rigid body filtering
+    n_avail = min(n_all, len(result.frequencies))
+
+    L = bar.length
+    nodes = result.nodes
+    # Element lengths
+    L_e = np.diff(nodes)
+    # Mid-element positions as fraction of length
+    x_mid = (nodes[:-1] + L_e / 2) / L
+
+    # Compute normalised curvature for all available modes.
+    mode_curvatures = []
+    for m in range(n_avail):
+        mode = result.get_mode(m + 1)  # 1-indexed
+        psi = mode.rotations            # rotation at each node
+        # Curvature ≈ dψ/dx at element midpoints
+        curv = np.abs(np.diff(psi) / L_e)
+        mx = curv.max()
+        if mx > 0:
+            curv = curv / mx            # normalise to 0-1
+        mode_curvatures.append(curv)
+
+    # Composite score: weight only the first n_modes for ranking.
+    composite = np.zeros_like(x_mid)
+    for m in range(min(n_modes, n_avail)):
+        composite += mode_curvatures[m] / (m + 1)
+
+    # Collect individual-mode curvature peaks from ALL modes.
+    candidates = []
+    for curv in mode_curvatures:
+        for i in range(1, len(curv) - 1):
+            if curv[i] > curv[i - 1] and curv[i] > curv[i + 1]:
+                p = float(x_mid[i])
+                if 0.08 < p < 0.92:
+                    candidates.append((p, float(composite[i])))
+
+    candidates.sort(key=lambda t: -t[1])
+
+    # Select: centre first, then symmetric pairs by score.
+    result_pos = [0.5]
+    seen = {0.5}
+    for pos, _ in candidates:
+        pos = round(pos, 3)
+        if abs(pos - 0.5) < 0.015:
+            continue
+        mirror = round(1.0 - pos, 3)
+        lo, hi = min(pos, mirror), max(pos, mirror)
+        if any(abs(lo - s) < merge_tol for s in seen):
+            continue
+        seen.update([lo, hi])
+        result_pos.extend([lo, hi])
+
+    return result_pos
 
 
 @dataclass
@@ -204,16 +300,29 @@ class UndercutConfig:
     max_total_depth_mm: Optional[float] = None  # Hard limit on sum of all cut depths (mm)
     
     @classmethod
-    def from_n_cuts(cls, n_cuts: int, width_mm: float = 1.0) -> 'UndercutConfig':
-        """Create config with *n_cuts* cuts at free-free beam curvature peaks.
+    def from_n_cuts(cls, n_cuts: int, width_mm: float = 1.0, *,
+                    bar=None, material=None,
+                    n_modes: Optional[int] = None) -> 'UndercutConfig':
+        """Create config with *n_cuts* cuts at beam curvature peaks.
 
-        Positions are computed from the bending-moment peaks of a uniform
-        free-free beam — the locations where material removal has the
-        greatest effect on each mode's frequency.  These positions apply
-        to any bar-type idiophone regardless of material or target ratios.
+        Positions are computed from the bending-curvature peaks of a
+        uniform free-free beam — the locations where material removal
+        has the greatest effect on each mode's frequency.
+
+        If *bar* and *material* are provided, a Timoshenko FEM analysis
+        is used to find the curvature peaks.  This accounts for shear
+        deformation and rotary inertia, which shifts higher-mode peaks
+        noticeably for wood (E/G ≈ 14).  Without them, the analytical
+        Euler-Bernoulli solution is used (universal, material-independent).
+
+        *n_modes* controls how many vibration modes contribute to the
+        composite effectiveness score that ranks cut positions.  Lower
+        values focus positions on the modes you actually need to tune.
+        Default is 8 (E-B) or the lesser of 8 and available modes
+        (Timoshenko).
 
         The centre (0.50) is always included.  Additional cuts are added
-        as symmetric pairs, prioritising lower vibration modes first.
+        as symmetric pairs, prioritising the most effective positions.
 
         *n_cuts* must be odd (centre + symmetric pairs).  Even values
         are rounded up.
@@ -231,7 +340,15 @@ class UndercutConfig:
             raise ValueError("n_cuts must be at least 1")
         if n_cuts % 2 == 0:
             n_cuts += 1
-        all_positions = _free_free_curvature_peaks()
+
+        nm = n_modes if n_modes is not None else 8
+
+        if bar is not None and material is not None:
+            all_positions = _timoshenko_curvature_peaks(bar, material,
+                                                        n_modes=nm)
+        else:
+            all_positions = _free_free_curvature_peaks(n_modes=nm)
+
         positions = all_positions[:n_cuts]
 
         return cls(
