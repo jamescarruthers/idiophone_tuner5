@@ -143,53 +143,54 @@ config.max_total_depth_mm = None
 # Run optimisation
 # =========================================================================
 
-result = optimize_bar(
-    bar, material, target, config,
+if __name__ == '__main__':
+    result = optimize_bar(
+        bar, material, target, config,
 
-    # -- Mesh resolution --
-    n_elements=120,              # Coarse element count between cuts
-                                 # Higher = more accurate, slower
-    min_elements_per_cut=8,      # Fine elements spanning each cut width
-                                 # Increase for very narrow cuts
+        # -- Mesh resolution --
+        n_elements=120,              # Coarse element count between cuts
+                                     # Higher = more accurate, slower
+        min_elements_per_cut=8,      # Fine elements spanning each cut width
+                                     # Increase for very narrow cuts
 
-    # -- Optimisation method --
-    method='differential_evolution',  # 'differential_evolution' (global, robust)
-                                      # 'SLSQP' (local gradient, fast but needs
-                                      #          good starting point)
+        # -- Optimisation method --
+        method='differential_evolution',  # 'differential_evolution' (global, robust)
+                                          # 'SLSQP' (local gradient, fast but needs
+                                          #          good starting point)
 
-    # -- Output --
-    verbose=True,                # Print progress to stdout
-    progress_every=50,           # Status line every N evaluations (0 = off)
-    callback=my_progress,        # Custom callback on each improvement (or None)
+        # -- Output --
+        verbose=True,                # Print progress to stdout
+        progress_every=50,           # Status line every N evaluations (0 = off)
+        callback=my_progress,        # Custom callback on each improvement (or None)
 
-    # -- Parallelism --
-    workers=1,                   # 1 = single-process (full per-eval progress)
-                                 # -1 = all CPUs (faster, per-generation progress)
-                                 # N  = use N worker processes
+        # -- Parallelism --
+        workers=1,                   # 1 = single-process (full per-eval progress)
+                                     # -1 = all CPUs (faster, per-generation progress)
+                                     # N  = use N worker processes
 
-    # -- Early stopping --
-    convergence_cents=1.0        # Stop when every mode is within ±N cents
-                                 # None = run to completion / DE convergence
-)
-
-
-# =========================================================================
-# Results
-# =========================================================================
-
-print(result.summary())
+        # -- Early stopping --
+        convergence_cents=1.0        # Stop when every mode is within ±N cents
+                                     # None = run to completion / DE convergence
+    )
 
 
-# =========================================================================
-# Tuning guide for hand-finishing
-# =========================================================================
-# Shows how each cut affects each mode (cents per mm of additional depth).
-# Useful for fine-tuning after CNC roughing.
+    # =========================================================================
+    # Results
+    # =========================================================================
 
-guide = compute_tuning_guide(
-    result, bar, material, config,
-    n_elements=60,               # Mesh resolution for sensitivity calc
-    min_elements_per_cut=8,
-    delta_mm=0.1                 # Perturbation step for finite-difference
-)
-print(guide)
+    print(result.summary())
+
+
+    # =========================================================================
+    # Tuning guide for hand-finishing
+    # =========================================================================
+    # Shows how each cut affects each mode (cents per mm of additional depth).
+    # Useful for fine-tuning after CNC roughing.
+
+    guide = compute_tuning_guide(
+        result, bar, material, config,
+        n_elements=60,               # Mesh resolution for sensitivity calc
+        min_elements_per_cut=8,
+        delta_mm=0.1                 # Perturbation step for finite-difference
+    )
+    print(guide)
