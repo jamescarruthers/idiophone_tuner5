@@ -123,6 +123,8 @@ class UndercutConfig:
     min_depth_mm: float = 0.0       # Minimum depth
     max_depth_fraction: float = 0.85  # Maximum depth as fraction of thickness
     profile: str = 'flat'           # 'flat' or 'parabolic'
+    max_trim_mm: float = 0.0       # Max amount the bar may be shortened (mm)
+    max_extend_mm: float = 0.0     # Max amount the bar may be lengthened (mm)
     
     @classmethod
     def single_center(cls, width_mm: float = 1.0) -> 'UndercutConfig':
@@ -238,7 +240,8 @@ class OptimizationResult:
     ratio_errors: np.ndarray
     n_iterations: int
     message: str = ""
-    
+    optimized_length_mm: Optional[float] = None
+
     def summary(self) -> str:
         """Generate a human-readable summary."""
         lines = []
@@ -250,7 +253,11 @@ class OptimizationResult:
         if self.message:
             lines.append(f"Message: {self.message}")
         lines.append("")
-        
+
+        if self.optimized_length_mm is not None:
+            lines.append(f"BAR LENGTH: {self.optimized_length_mm:.2f} mm")
+            lines.append("")
+
         lines.append("UNDERCUT DEPTHS:")
         for i, depth in enumerate(self.undercut_depths_mm):
             pos = self.optimized_geometry.undercuts[i].center
@@ -287,12 +294,14 @@ class _FastObjective:
 
     When *sym_matrix* is provided the optimiser works in a reduced variable
     space where symmetric cut pairs share a single depth variable.
-    ``effective_depth_matrix = depth_matrix @ sym_matrix`` so the input
-    vector has length ``n_independent`` rather than ``n_cuts``.
+
+    When *optimize_length* is True the first element of the input vector is
+    a length offset (metres) and element lengths are scaled accordingly.
     """
 
     def __init__(self, depth_matrix, base_thickness, width, L_e, E, G, rho,
-                 n_modes, target_freqs, weights, ratios, sym_matrix=None):
+                 n_modes, target_freqs, weights, ratios, sym_matrix=None,
+                 optimize_length=False, base_length=None):
         if sym_matrix is not None:
             self.depth_matrix = depth_matrix @ sym_matrix
         else:
@@ -307,8 +316,18 @@ class _FastObjective:
         self.target_freqs = target_freqs
         self.weights = weights
         self.ratios = ratios
+        self.optimize_length = optimize_length
+        self.base_length = base_length
 
-    def __call__(self, depths):
+    def __call__(self, x):
+        if self.optimize_length:
+            length_offset = x[0]
+            depths = x[1:]
+            L_e = self.L_e * ((self.base_length + length_offset) / self.base_length)
+        else:
+            depths = x
+            L_e = self.L_e
+
         h = self.base_thickness - self.depth_matrix @ depths
         np.maximum(h, 1e-6, out=h)
         A = self.width * h
@@ -316,7 +335,7 @@ class _FastObjective:
 
         try:
             freqs = fast_compute_frequencies(
-                self.L_e, self.E, self.G, self.rho, A, I_val, self.n_modes)
+                L_e, self.E, self.G, self.rho, A, I_val, self.n_modes)
         except Exception:
             return 1e10
 
@@ -458,11 +477,12 @@ def optimize_bar(
     max_depth = base_geometry.thickness * undercut_config.max_depth_fraction
 
     # Pre-compute depth influence matrix and element lengths
+    base_length = base_geometry.length
     depth_matrix, L_e = _build_depth_matrix(
         undercut_config.positions,
         undercut_config.width_mm / 1000,
         undercut_config.profile,
-        base_geometry.length,
+        base_length,
         n_elements
     )
 
@@ -471,9 +491,16 @@ def optimize_bar(
     effective_depth_matrix = depth_matrix @ sym_matrix
     n_independent = sym_matrix.shape[1]
 
-    # Bounds for optimization – one per independent variable (meters)
-    bounds = [(undercut_config.min_depth_mm / 1000, max_depth)
-              for _ in range(n_independent)]
+    # Length optimisation: optionally prepend a length-offset variable.
+    optimize_length = (undercut_config.max_trim_mm > 0
+                       or undercut_config.max_extend_mm > 0)
+    length_bound = (-undercut_config.max_trim_mm / 1000,
+                    undercut_config.max_extend_mm / 1000)
+
+    # Bounds: [length_offset (optional), depth1, depth2, ...]
+    depth_bounds = [(undercut_config.min_depth_mm / 1000, max_depth)
+                    for _ in range(n_independent)]
+    bounds = ([length_bound] + depth_bounds) if optimize_length else depth_bounds
 
     base_thickness = base_geometry.thickness
     width = base_geometry.width
@@ -487,17 +514,26 @@ def optimize_bar(
     weights = weights / weights.sum()
     target_ratios = np.array(target.ratios[:n_modes])
 
-    def _compute_cost_and_freqs(depths):
+    def _compute_cost_and_freqs(x):
         """Shared cost computation used by both single- and multi-process paths.
 
-        *depths* is in the reduced (independent) variable space.
+        *x* is the full optimisation vector: an optional length offset
+        followed by the reduced (independent) depth variables.
         """
+        if optimize_length:
+            length_offset = x[0]
+            depths = x[1:]
+            cur_L_e = L_e * ((base_length + length_offset) / base_length)
+        else:
+            depths = x
+            cur_L_e = L_e
+
         h = base_thickness - effective_depth_matrix @ depths
         np.maximum(h, 1e-6, out=h)
         A = width * h
         I_val = width * h ** 3 / 12.0
 
-        freqs = fast_compute_frequencies(L_e, E, G, rho, A, I_val, n_modes)
+        freqs = fast_compute_frequencies(cur_L_e, E, G, rho, A, I_val, n_modes)
         if len(freqs) < n_modes:
             return 1e10, None
 
@@ -515,13 +551,13 @@ def optimize_bar(
     eval_count = [0]
     best_cost = [np.inf]
     best_freqs = [None]
-    best_depths = [None]
+    best_x = [None]
 
-    def objective(depths: np.ndarray) -> float:
+    def objective(x: np.ndarray) -> float:
         eval_count[0] += 1
 
         try:
-            cost, freqs = _compute_cost_and_freqs(depths)
+            cost, freqs = _compute_cost_and_freqs(x)
         except Exception:
             return 1e10
 
@@ -533,7 +569,7 @@ def optimize_bar(
         if is_new_best:
             best_cost[0] = cost
             best_freqs[0] = freqs.copy()
-            best_depths[0] = depths.copy()
+            best_x[0] = x.copy()
 
         show_progress = verbose and progress_every > 0 and (
             is_new_best or eval_count[0] % progress_every == 0
@@ -543,13 +579,18 @@ def optimize_bar(
             ratios = freqs / freqs[0]
             marker = "★ NEW BEST" if is_new_best else ""
 
-            print(f"[{eval_count[0]:4d}] f1={freqs[0]:6.1f}Hz  "
+            length_info = ""
+            if optimize_length:
+                cur_len_mm = (base_length + x[0]) * 1000
+                length_info = f"L={cur_len_mm:.1f}mm  "
+
+            print(f"[{eval_count[0]:4d}] {length_info}f1={freqs[0]:6.1f}Hz  "
                   f"ratios=1:{ratios[1]:.2f}:{ratios[2]:.2f}  "
                   f"cost={cost:8.1f}  {marker}")
             sys.stdout.flush()
 
         if is_new_best and callback:
-            callback(eval_count[0], freqs, depths, cost)
+            callback(eval_count[0], freqs, x, cost)
 
         return cost
 
@@ -557,6 +598,10 @@ def optimize_bar(
         print(f"Optimizing {n_cuts} undercuts ({n_independent} independent, "
               f"{n_cuts - n_independent} symmetric) for target "
               f"{target.f1_target:.1f} Hz")
+        if optimize_length:
+            print(f"Length optimisation: trim up to {undercut_config.max_trim_mm:.1f} mm, "
+                  f"extend up to {undercut_config.max_extend_mm:.1f} mm  "
+                  f"(base {base_length * 1000:.1f} mm)")
         note, _ = frequency_to_note(target.f1_target)
         print(f"Target note: {note}")
         print(f"Target ratios: {target.ratios}")
@@ -575,7 +620,9 @@ def optimize_bar(
             fast_obj = _FastObjective(
                 depth_matrix, base_thickness, width, L_e, E, G, rho,
                 n_modes, target_freqs, weights, target_ratios,
-                sym_matrix=sym_matrix)
+                sym_matrix=sym_matrix,
+                optimize_length=optimize_length,
+                base_length=base_length)
 
             de_gen_count = [0]
 
@@ -623,14 +670,15 @@ def optimize_bar(
                 updating='immediate'
             )
 
-        optimal_independent = result.x
+        optimal_result_x = result.x
         success = result.success
         message = result.message
         n_iter = result.nit
 
     elif method == 'SLSQP':
         # Local gradient-based optimizer
-        x0 = np.array([max_depth * 0.3 for _ in range(n_independent)])
+        x0_depths = [max_depth * 0.3 for _ in range(n_independent)]
+        x0 = np.array(([0.0] + x0_depths) if optimize_length else x0_depths)
         result = minimize(
             objective,
             x0,
@@ -638,7 +686,7 @@ def optimize_bar(
             bounds=bounds,
             options={'maxiter': 500, 'ftol': 1e-6}
         )
-        optimal_independent = result.x
+        optimal_result_x = result.x
         success = result.success
         message = result.message
         n_iter = result.nit
@@ -646,11 +694,26 @@ def optimize_bar(
     else:
         raise ValueError(f"Unknown method: {method}")
 
+    # Split optimisation result into length offset and independent depths.
+    if optimize_length:
+        optimal_length_offset = optimal_result_x[0]
+        optimal_independent = optimal_result_x[1:]
+        optimized_length = base_length + optimal_length_offset
+    else:
+        optimal_independent = optimal_result_x
+        optimized_length = base_length
+
     # Expand independent depths back to per-cut depths (symmetric pairs
     # receive the same value).
     optimal_depths = sym_matrix @ optimal_independent
 
-    # Build final geometry
+    # Build final geometry (with optimised length if applicable)
+    final_bar = BarGeometry(
+        length=optimized_length,
+        width=base_geometry.width,
+        thickness=base_geometry.thickness,
+        undercuts=[]
+    )
     final_undercuts = [
         Undercut(
             center=undercut_config.positions[i],
@@ -660,7 +723,7 @@ def optimize_bar(
         )
         for i in range(n_cuts)
     ]
-    final_geometry = base_geometry.copy_with_undercuts(final_undercuts)
+    final_geometry = final_bar.copy_with_undercuts(final_undercuts)
 
     # Compute final frequencies
     final_freqs = compute_frequencies(final_geometry, material, n_elements, n_modes)
@@ -681,7 +744,8 @@ def optimize_bar(
         frequency_errors_cents=cents_errors,
         ratio_errors=ratio_errors,
         n_iterations=n_iter,
-        message=message
+        message=message,
+        optimized_length_mm=optimized_length * 1000 if optimize_length else None
     )
 
 
