@@ -13,15 +13,20 @@ def my_progress(iteration, frequencies, x, cost):
     print(f"        x: {[f'{v:.1f}' for v in x_mm]}")
 
 material = get_material('sapele')
+
+material.E = 10.65e9  # Pa
+material.rho = 662  # kg/m³
+
 bar = create_bar(480, 32, 24)
 target = TuningTarget.from_note('F4', ratios=(1, 3, 6))
 
-config = UndercutConfig.xylophone_physics(width_mm=2.0)
-config.max_trim_mm = 20.0
+config = UndercutConfig.xylophone_physics(width_mm=1.0)
+config.max_trim_mm = 200.0
 config.max_extend_mm = 20.0
 
-result = optimize_bar(bar, material, target, config, n_elements=60,
-                      verbose=True, callback=my_progress, progress_every=50)
+result = optimize_bar(bar, material, target, config, n_elements=120,
+                      verbose=True, callback=my_progress, progress_every=50,
+                      convergence_cents=1.0)
 print(result.summary())
 
 guide = compute_tuning_guide(result, bar, material, config, n_elements=60)

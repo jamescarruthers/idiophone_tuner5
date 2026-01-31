@@ -276,9 +276,11 @@ class OptimizationResult:
             lines.append("")
 
         lines.append("UNDERCUT DEPTHS:")
+        bar_length_mm = self.optimized_geometry.length * 1000
         for i, depth in enumerate(self.undercut_depths_mm):
             pos = self.optimized_geometry.undercuts[i].center
-            lines.append(f"  Cut {i+1} at {pos:.1%}: {depth:.2f} mm")
+            pos_mm = pos * bar_length_mm
+            lines.append(f"  Cut {i+1} at {pos:.1%} ({pos_mm:.1f} mm): {depth:.2f} mm")
         lines.append("")
         
         lines.append("FREQUENCIES:")
@@ -526,7 +528,8 @@ def optimize_bar(
     progress_every: int = 20,
     callback: Optional[Callable] = None,
     workers: int = 1,
-    min_elements_per_cut: int = 8
+    min_elements_per_cut: int = 8,
+    convergence_cents: Optional[float] = None
 ) -> OptimizationResult:
     """
     Optimize undercut depths to achieve target frequencies.
@@ -548,6 +551,8 @@ def optimize_bar(
         workers: Number of parallel workers for differential_evolution.
             1 = single-process (full progress tracking).
             -1 = use all CPU cores (faster, per-generation progress only).
+        convergence_cents: Stop early when all mode frequencies are within
+            this many cents of the target. None disables early stopping.
 
     Returns:
         OptimizationResult with optimized geometry and achieved frequencies
@@ -644,9 +649,13 @@ def optimize_bar(
     best_cost = [np.inf]
     best_freqs = [None]
     best_x = [None]
+    converged = [False]
 
     def objective(x: np.ndarray) -> float:
         eval_count[0] += 1
+
+        if converged[0]:
+            return best_cost[0]
 
         try:
             cost, freqs = _compute_cost_and_freqs(x)
@@ -662,6 +671,11 @@ def optimize_bar(
             best_cost[0] = cost
             best_freqs[0] = freqs.copy()
             best_x[0] = x.copy()
+
+            if convergence_cents is not None:
+                cents_errs = 1200.0 * np.log2(freqs / target_freqs)
+                if np.all(np.abs(cents_errs) <= convergence_cents):
+                    converged[0] = True
 
         show_progress = verbose and progress_every > 0 and (
             is_new_best or eval_count[0] % progress_every == 0
@@ -710,6 +724,10 @@ def optimize_bar(
             print(f"Using {n_cpus} parallel workers")
         print("")
 
+    # When convergence_cents is set, disable DE's built-in population
+    # convergence so it only stops via our per-mode cents callback.
+    de_tol = 0 if convergence_cents is not None else 1e-4
+
     # Run optimization
     if method == 'differential_evolution':
         use_parallel = workers != 1
@@ -727,24 +745,34 @@ def optimize_bar(
 
             def _de_callback(xk, convergence):
                 de_gen_count[0] += 1
-                if verbose:
+                freqs = None
+                if verbose or convergence_cents is not None:
                     try:
                         cost, freqs = _compute_cost_and_freqs(xk)
-                        if freqs is not None:
-                            ratios = freqs / freqs[0]
-                            ratio_str = ":".join(f"{r:.2f}" for r in ratios)
-                            print(f"[gen {de_gen_count[0]:3d}] f1={freqs[0]:6.1f}Hz  "
-                                  f"ratios={ratio_str}  "
-                                  f"cost={cost:8.1f}  conv={convergence:.6f}")
-                            sys.stdout.flush()
                     except Exception:
                         pass
+
+                if verbose and freqs is not None:
+                    ratios = freqs / freqs[0]
+                    ratio_str = ":".join(f"{r:.2f}" for r in ratios)
+                    print(f"[gen {de_gen_count[0]:3d}] f1={freqs[0]:6.1f}Hz  "
+                          f"ratios={ratio_str}  "
+                          f"cost={cost:8.1f}  conv={convergence:.6f}")
+                    sys.stdout.flush()
+
+                if convergence_cents is not None and freqs is not None:
+                    cents_errs = 1200.0 * np.log2(freqs / target_freqs)
+                    if np.all(np.abs(cents_errs) <= convergence_cents):
+                        if verbose:
+                            print(f"\nConverged: all modes within "
+                                  f"+/-{convergence_cents:.1f} cents of target")
+                        return True
 
             result = differential_evolution(
                 fast_obj,
                 bounds=bounds,
                 maxiter=500,
-                tol=1e-4,
+                tol=de_tol,
                 seed=42,
                 polish=True,
                 workers=workers,
@@ -756,18 +784,26 @@ def optimize_bar(
             )
         else:
             # Single process: use closure with full progress, immediate updating
+            def _sp_callback(xk, convergence):
+                if converged[0]:
+                    if verbose:
+                        print(f"\nConverged: all modes within "
+                              f"+/-{convergence_cents:.1f} cents of target")
+                    return True
+
             result = differential_evolution(
                 objective,
                 bounds=bounds,
                 maxiter=500,
-                tol=1e-4,
+                tol=de_tol,
                 seed=42,
                 polish=True,
                 workers=1,
                 mutation=(0.5, 1.0),
                 recombination=0.7,
                 popsize=10,
-                updating='immediate'
+                updating='immediate',
+                callback=_sp_callback if convergence_cents is not None else None
             )
 
         optimal_result_x = result.x
@@ -791,8 +827,17 @@ def optimize_bar(
         message = result.message
         n_iter = result.nit
 
+        if converged[0] and verbose:
+            print(f"\nConverged: all modes within "
+                  f"+/-{convergence_cents:.1f} cents of target")
+
     else:
         raise ValueError(f"Unknown method: {method}")
+
+    # If converged early, use the best tracked solution (the optimizer
+    # may have continued evaluating after the flag was set).
+    if converged[0] and best_x[0] is not None:
+        optimal_result_x = best_x[0]
 
     # Split optimisation result into length offset and independent depths.
     if optimize_length:
