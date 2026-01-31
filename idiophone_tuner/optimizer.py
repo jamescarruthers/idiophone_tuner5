@@ -171,34 +171,53 @@ class UndercutConfig:
     @classmethod
     def xylophone_physics(cls, width_mm: float = 1.0) -> 'UndercutConfig':
         """
-        Physics-optimized positions for xylophone tuning (up to 4 modes).
+        Physics-optimized positions for 3-mode xylophone (1:3:6) tuning.
 
-        Based on mode shape curvature analysis:
+        Cuts are placed at mode 1–3 curvature peaks only:
 
-        Mode 1 (fundamental): Max curvature at CENTER (0.5)
-            - Nodes at 0.224, 0.776
+        Mode 1: Antinode at 0.50; nodes at 0.224, 0.776
+        Mode 2: Antinodes at ~0.31, 0.69; nodes at 0.132, 0.5, 0.868
+        Mode 3: Antinodes at ~0.22, 0.50, 0.78; nodes at 0.094, 0.356,
+                 0.644, 0.906
 
-        Mode 2: Max curvature at ~0.31, 0.69 (between its nodes)
-            - Nodes at 0.132, 0.5, 0.868
-
-        Mode 3: Max curvature at ~0.22, 0.50, 0.78
-            - Nodes at 0.094, 0.356, 0.644, 0.906
-
-        Mode 4: Max curvature at ~0.18, 0.39, 0.61, 0.83
-            - Nodes at 0.073, 0.277, 0.500, 0.723, 0.927
-
-        15 cuts (8 independent with symmetry) gives enough degrees of
-        freedom for independent 4-mode control.
+        11 cuts (6 independent with symmetry).
         """
         positions = [
-            0.50,             # Center - affects f1, f3, f4 strongly
+            0.50,             # Center - f1 and f3 antinode
+            0.45, 0.55,       # Near center - strong f1 effect
+            0.38, 0.62,       # f1 region, some f2
+            0.30, 0.70,       # f2 curvature region
+            0.22, 0.78,       # f3 antinode, near f1 nodes
+            0.14, 0.86,       # f3 curvature region, past f1 nodes
+        ]
+
+        return cls(
+            positions=positions,
+            width_mm=width_mm,
+            max_depth_fraction=0.85
+        )
+
+    @classmethod
+    def xylophone_physics_4mode(cls, width_mm: float = 1.0) -> 'UndercutConfig':
+        """
+        Physics-optimized positions for 4-mode xylophone (1:3:6:10) tuning.
+
+        Extends the 3-mode config with mode 4 antinode positions:
+
+        Mode 4: Antinodes at ~0.175, 0.39, 0.61, 0.825;
+                 nodes at 0.073, 0.277, 0.500, 0.723, 0.927
+
+        15 cuts (8 independent with symmetry).
+        """
+        positions = [
+            0.50,             # Center - f1, f3, f4 antinode
             0.45, 0.55,       # Near center - strong f1 effect
             0.39, 0.61,       # f4 antinode (~0.390, 0.610)
             0.30, 0.70,       # f2 curvature region
             0.22, 0.78,       # f3 antinode, near f1 nodes
             0.175, 0.825,     # f4 antinode (~0.175, 0.825)
             0.14, 0.86,       # f3 curvature region, past f1 nodes
-            0.09, 0.91,       # Near f4 node (0.077, 0.923) / f3 outer region
+            0.09, 0.91,       # Near f4 node / f3 outer region
         ]
 
         return cls(

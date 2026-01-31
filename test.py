@@ -16,8 +16,8 @@ material = get_material('sapele')
 bar = create_bar(480, 32, 24)
 target = TuningTarget.from_note('F4', ratios=(1, 3, 6, 10))
 
-# Use the physics-based 11-cut config with length optimisation
-config = UndercutConfig.xylophone_physics(width_mm=2.0)
+# Use the physics-based 15-cut config for 4-mode tuning
+config = UndercutConfig.xylophone_physics_4mode(width_mm=2.0)
 config.max_trim_mm = 20.0
 config.max_extend_mm = 20.0
 
