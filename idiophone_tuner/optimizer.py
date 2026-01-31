@@ -398,7 +398,64 @@ def _build_symmetry_map(positions, tol=1e-6):
     return sym_matrix, groups
 
 
-def _build_depth_matrix(positions, width_m, profile, bar_length, n_elements):
+def _build_adaptive_nodes(positions, width_m, bar_length, min_per_cut=8,
+                          max_element_m=0.005):
+    """Build a non-uniform node array that is refined inside undercuts.
+
+    For narrow cuts the FEM needs several elements across each cut to
+    resolve the abrupt thickness change accurately.  Between cuts a
+    coarser mesh is sufficient.
+
+    Args:
+        positions: Cut centre positions as fractions of bar length.
+        width_m: Cut width in metres.
+        bar_length: Bar length in metres.
+        min_per_cut: Minimum number of elements spanning each cut.
+        max_element_m: Maximum element size in coarse regions (metres).
+
+    Returns:
+        1-D array of node positions (metres), sorted and unique.
+    """
+    cut_element = width_m / min_per_cut
+    half_w = width_m / 2.0
+
+    # Collect critical boundaries (cut edges + bar ends).
+    boundaries = {0.0, bar_length}
+    for pos in positions:
+        center = pos * bar_length
+        boundaries.add(max(0.0, center - half_w))
+        boundaries.add(min(bar_length, center + half_w))
+    boundaries = sorted(boundaries)
+
+    # Merge boundaries that are closer together than the fine element size.
+    merged = [boundaries[0]]
+    for b in boundaries[1:]:
+        if b - merged[-1] > cut_element * 0.5:
+            merged.append(b)
+    if merged[-1] != bar_length:
+        merged[-1] = bar_length
+
+    # Subdivide each interval with the appropriate element size.
+    all_nodes = [merged[0]]
+    for i in range(len(merged) - 1):
+        start = merged[i]
+        end = merged[i + 1]
+        span = end - start
+
+        mid = (start + end) / 2.0
+        in_cut = any(abs(mid - p * bar_length) <= half_w + 1e-9
+                     for p in positions)
+
+        target = cut_element if in_cut else max_element_m
+        n_sub = max(1, round(span / target))
+
+        sub_nodes = np.linspace(start, end, n_sub + 1)
+        all_nodes.extend(sub_nodes[1:].tolist())
+
+    return np.array(all_nodes)
+
+
+def _build_depth_matrix(positions, width_m, profile, bar_length, nodes):
     """Build the depth influence matrix for vectorized thickness computation.
 
     Returns an (n_elements, n_cuts) matrix where entry [j, i] gives the
@@ -406,11 +463,14 @@ def _build_depth_matrix(positions, width_m, profile, bar_length, n_elements):
     For flat profiles this is 0 or 1; for shaped profiles it's the
     profile envelope value.
 
+    *nodes* is a 1-D array of FEM node positions (metres) — typically
+    produced by :func:`_build_adaptive_nodes`.
+
     Thickness at any midpoint is: h = base_thickness - depth_matrix @ depths
     """
-    nodes = np.linspace(0, bar_length, n_elements + 1)
-    x_mid = (nodes[:-1] + nodes[1:]) / 2.0  # meters
+    x_mid = (nodes[:-1] + nodes[1:]) / 2.0  # element midpoints
     L_e = np.diff(nodes)
+    n_elements = len(L_e)
     n_cuts = len(positions)
 
     depth_matrix = np.zeros((n_elements, n_cuts))
@@ -448,17 +508,22 @@ def optimize_bar(
     verbose: bool = True,
     progress_every: int = 20,
     callback: Optional[Callable] = None,
-    workers: int = 1
+    workers: int = 1,
+    min_elements_per_cut: int = 8
 ) -> OptimizationResult:
     """
     Optimize undercut depths to achieve target frequencies.
+
+    The FEM mesh is built adaptively: dense elements (at least
+    *min_elements_per_cut*) inside each undercut for accuracy, and
+    coarser elements (governed by *n_elements*) in between.
 
     Args:
         base_geometry: Initial bar geometry (without undercuts)
         material: Material properties
         target: Target frequencies and ratios
         undercut_config: Undercut positions and constraints
-        n_elements: FEM mesh density
+        n_elements: Controls coarse mesh spacing between cuts
         method: 'differential_evolution' (global) or 'SLSQP' (local gradient)
         verbose: Print progress
         progress_every: Print status every N evaluations (0 to disable)
@@ -476,14 +541,24 @@ def optimize_bar(
     # Maximum depth constraint
     max_depth = base_geometry.thickness * undercut_config.max_depth_fraction
 
-    # Pre-compute depth influence matrix and element lengths
+    # Build adaptive FEM mesh: dense inside cuts, coarse between.
     base_length = base_geometry.length
+    width_m = undercut_config.width_mm / 1000
+    max_element_m = base_length / max(n_elements, 1)
+
+    nodes = _build_adaptive_nodes(
+        undercut_config.positions, width_m, base_length,
+        min_per_cut=min_elements_per_cut,
+        max_element_m=max_element_m
+    )
+
+    # Pre-compute depth influence matrix and element lengths
     depth_matrix, L_e = _build_depth_matrix(
         undercut_config.positions,
-        undercut_config.width_mm / 1000,
+        width_m,
         undercut_config.profile,
         base_length,
-        n_elements
+        nodes
     )
 
     # Enforce symmetric cuts: mirror-pairs share one depth variable.
@@ -594,6 +669,10 @@ def optimize_bar(
 
         return cost
 
+    n_total_elements = len(L_e)
+    min_elem_mm = L_e.min() * 1000
+    max_elem_mm = L_e.max() * 1000
+
     if verbose:
         print(f"Optimizing {n_cuts} undercuts ({n_independent} independent, "
               f"{n_cuts - n_independent} symmetric) for target "
@@ -602,6 +681,8 @@ def optimize_bar(
             print(f"Length optimisation: trim up to {undercut_config.max_trim_mm:.1f} mm, "
                   f"extend up to {undercut_config.max_extend_mm:.1f} mm  "
                   f"(base {base_length * 1000:.1f} mm)")
+        print(f"Adaptive mesh: {n_total_elements} elements "
+              f"(element size {min_elem_mm:.2f}–{max_elem_mm:.2f} mm)")
         note, _ = frequency_to_note(target.f1_target)
         print(f"Target note: {note}")
         print(f"Target ratios: {target.ratios}")
@@ -725,8 +806,21 @@ def optimize_bar(
     ]
     final_geometry = final_bar.copy_with_undercuts(final_undercuts)
 
-    # Compute final frequencies
-    final_freqs = compute_frequencies(final_geometry, material, n_elements, n_modes)
+    # Compute final frequencies using an adaptive mesh for accuracy.
+    verify_nodes = _build_adaptive_nodes(
+        undercut_config.positions, width_m, optimized_length,
+        min_per_cut=min_elements_per_cut,
+        max_element_m=max_element_m
+    )
+    verify_L_e = np.diff(verify_nodes)
+    verify_mid = (verify_nodes[:-1] + verify_nodes[1:]) / 2.0
+    verify_mid_rel = verify_mid / optimized_length
+    verify_h = np.array([final_geometry.thickness_at(xr) for xr in verify_mid_rel])
+    verify_A = base_geometry.width * verify_h
+    verify_I = base_geometry.width * verify_h ** 3 / 12.0
+    final_freqs = fast_compute_frequencies(
+        verify_L_e, E, G, rho, verify_A, verify_I, n_modes
+    )
     target_freqs_arr = target.target_frequencies
 
     # Compute errors
