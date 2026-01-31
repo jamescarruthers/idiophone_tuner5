@@ -79,11 +79,12 @@ target = TuningTarget.from_note(
 # Cut pattern presets:
 #   .single_center(width_mm)           1 cut
 #   .multi_point(n_cuts, width_mm)     1/3/5/7/9 symmetric cuts
-#   .xylophone_physics(width_mm)       11 cuts for 1:3:6   (recommended)
-#   .xylophone_physics_4mode(width_mm) 15 cuts for 1:3:6:10
-#   .xylophone_dense(width_mm)         15 cuts at 5% intervals
+#   .compact(width_mm)                 5 cuts — fast, good for 2-3 modes
+#   .standard(width_mm)                11 cuts — full 3-mode coverage
+#   .extended(width_mm)                15 cuts — 4-mode coverage
+#   .dense(width_mm)                   15 cuts at 5% intervals
 
-config = UndercutConfig.xylophone_physics(width_mm=1.0)
+config = UndercutConfig.compact(width_mm=1.0)
 
 # --- Cut depth constraints ---
 config.min_depth_mm       = 0.0    # Floor: minimum cut depth (mm)
@@ -128,8 +129,8 @@ config.max_extend_mm = 20.0       # Max bar lengthening allowed (mm)
 # The optimiser will still hit the target frequencies but will favour
 # solutions that are less aggressive on both axes.
 
-config.depth_penalty_weight       = 0.0
-config.length_penalty_weight      = 0.0
+config.depth_penalty_weight       = 0.2
+config.length_penalty_weight      = 0.05
 config.total_depth_penalty_weight = 0.0
 
 # --- Total depth hard limit ---
@@ -164,13 +165,16 @@ if __name__ == '__main__':
         callback=my_progress,        # Custom callback on each improvement (or None)
 
         # -- Parallelism --
-        workers=1,                   # 1 = single-process (full per-eval progress)
+        workers=-1,                   # 1 = single-process (full per-eval progress)
                                      # -1 = all CPUs (faster, per-generation progress)
                                      # N  = use N worker processes
 
         # -- Early stopping --
-        convergence_cents=1.0        # Stop when every mode is within ±N cents
+        convergence_cents=1.0,       # Stop when every mode is within ±N cents
                                      # None = run to completion / DE convergence
+
+        # -- High-resolution verification --
+        verify_n_elements=1000        # Re-analyse result on a finer mesh (or None)
     )
 
 

@@ -11,6 +11,34 @@ import numpy as np
 import math
 
 
+def profile_weight(u, profile):
+    """Compute normalised (0-1) profile weight(s) for normalised position *u*.
+
+    *u* can be a scalar or numpy array.  Values with ``|u| > 1`` (outside
+    the undercut) get weight 0.  This is the single source of truth for
+    all undercut profile shapes.
+    """
+    u = np.asarray(u, dtype=float)
+    scalar = u.ndim == 0
+    u = np.atleast_1d(u)
+
+    weights = np.zeros_like(u)
+    mask = np.abs(u) <= 1.0
+    if np.any(mask):
+        if profile == 'flat':
+            weights[mask] = 1.0
+        elif profile == 'parabolic':
+            weights[mask] = 1.0 - u[mask] ** 2
+        elif profile == 'cosine':
+            weights[mask] = 0.5 * (1.0 + np.cos(np.pi * u[mask]))
+        elif profile == 'elliptical':
+            weights[mask] = np.sqrt(1.0 - u[mask] ** 2)
+        else:
+            raise ValueError(f"Unknown profile type: {profile}")
+
+    return float(weights[0]) if scalar else weights
+
+
 @dataclass
 class Undercut:
     """
@@ -33,34 +61,14 @@ class Undercut:
     def depth_at(self, x_rel: float, bar_length: float) -> float:
         """
         Get undercut depth at position x_rel (fraction of bar length).
-        
+
         Returns 0 if outside the undercut region.
         """
         center_m = self.center * bar_length
         half_width = self.width / 2
         x_m = x_rel * bar_length
-        dx = x_m - center_m
-        
-        # Check if within undercut region
-        if abs(dx) > half_width:
-            return 0.0
-        
-        # Normalized position within undercut (-1 to 1)
-        u = dx / half_width
-        
-        if self.profile == 'flat':
-            return self.depth
-        elif self.profile == 'parabolic':
-            # Parabolic: depth * (1 - u^2)
-            return self.depth * (1 - u**2)
-        elif self.profile == 'cosine':
-            # Cosine: smooth transition
-            return self.depth * 0.5 * (1 + np.cos(np.pi * u))
-        elif self.profile == 'elliptical':
-            # Elliptical arch
-            return self.depth * np.sqrt(1 - u**2)
-        else:
-            raise ValueError(f"Unknown profile type: {self.profile}")
+        u = (x_m - center_m) / half_width
+        return self.depth * profile_weight(u, self.profile)
 
 
 @dataclass
