@@ -116,6 +116,78 @@ class TuningTarget:
         return np.array([self.f1_target * r for r in self.ratios])
 
 
+# =============================================================================
+# Free-free beam curvature peaks
+# =============================================================================
+
+# Eigenvalues βL for a free-free Euler-Bernoulli beam: cosh(βL)·cos(βL) = 1
+_FREE_FREE_BETA_L = [
+    4.73004074486,   # mode 1
+    7.85320462410,   # mode 2
+    10.99560783800,  # mode 3
+    14.13716549130,  # mode 4
+    17.27875965740,  # mode 5
+    20.42035224560,  # mode 6
+    23.56194490190,  # mode 7
+    26.70353755550,  # mode 8
+]
+
+
+def _free_free_curvature_peaks(n_modes=8, merge_tol=0.02):
+    """Interior curvature-peak positions for a uniform free-free beam.
+
+    For each of the first *n_modes* vibration modes, computes positions
+    (as fractions of bar length) where the bending-moment magnitude
+    |φ''(x)| reaches a local maximum.  These are the locations where
+    material removal has the greatest effect on each mode's frequency.
+
+    Returns a flat list ordered by mode priority: centre (0.5) first,
+    then pairs from mode 2, mode 3, etc.  Symmetric pairs are
+    consecutive (lo, hi).  Peaks within *merge_tol* of an already-
+    selected position are skipped.
+    """
+    xi = np.linspace(0, 1, 10001)
+    result = [0.5]
+    seen = {0.5}
+
+    for m in range(min(n_modes, len(_FREE_FREE_BETA_L))):
+        bL = _FREE_FREE_BETA_L[m]
+        s = (np.cosh(bL) - np.cos(bL)) / (np.sinh(bL) - np.sin(bL))
+
+        # |Curvature| ∝ |cosh(bLξ) - cos(bLξ) - σ(sinh(bLξ) - sin(bLξ))|
+        curv = np.abs(
+            np.cosh(bL * xi) - np.cos(bL * xi)
+            - s * (np.sinh(bL * xi) - np.sin(bL * xi))
+        )
+
+        # Collect interior local maxima (exclude outer 8%).
+        mode_peaks = []
+        for i in range(1, len(curv) - 1):
+            if curv[i] > curv[i - 1] and curv[i] > curv[i + 1]:
+                p = xi[i]
+                if 0.08 < p < 0.92:
+                    mode_peaks.append((p, curv[i]))
+
+        # Strongest peaks first within this mode.
+        mode_peaks.sort(key=lambda t: -t[1])
+
+        for pos, _ in mode_peaks:
+            pos = round(pos, 3)
+            if abs(pos - 0.5) < 0.015:
+                continue  # centre already included
+            mirror = round(1.0 - pos, 3)
+            lo, hi = min(pos, mirror), max(pos, mirror)
+
+            # Skip if too close to an existing position.
+            if any(abs(lo - s) < merge_tol for s in seen):
+                continue
+
+            seen.update([lo, hi])
+            result.extend([lo, hi])
+
+    return result
+
+
 @dataclass
 class UndercutConfig:
     """Configuration for narrow slot undercuts."""
@@ -132,158 +204,41 @@ class UndercutConfig:
     max_total_depth_mm: Optional[float] = None  # Hard limit on sum of all cut depths (mm)
     
     @classmethod
-    def single_center(cls, width_mm: float = 1.0) -> 'UndercutConfig':
-        """Single center cut."""
-        return cls(positions=[0.5], width_mm=width_mm)
-    
-    @classmethod
-    def multi_point(cls, n_cuts: int = 5, width_mm: float = 1.0) -> 'UndercutConfig':
+    def from_n_cuts(cls, n_cuts: int, width_mm: float = 1.0) -> 'UndercutConfig':
+        """Create config with *n_cuts* cuts at free-free beam curvature peaks.
+
+        Positions are computed from the bending-moment peaks of a uniform
+        free-free beam — the locations where material removal has the
+        greatest effect on each mode's frequency.  These positions apply
+        to any bar-type idiophone regardless of material or target ratios.
+
+        The centre (0.50) is always included.  Additional cuts are added
+        as symmetric pairs, prioritising lower vibration modes first.
+
+        *n_cuts* must be odd (centre + symmetric pairs).  Even values
+        are rounded up.
+
+        Recommended values::
+
+             5  (3 independent) — 2–3 mode control
+             7  (4 independent) — 3 mode control
+             9  (5 independent) — 3–4 mode control
+            11  (6 independent) — 4–5 mode control
+            13  (7 independent) — 5–6 mode control
+            15  (8 independent) — 6–7 mode control
         """
-        Multiple narrow cuts for tuning.
-        
-        More cuts = more control over mode ratios.
-        Positions chosen to affect different modes:
-        - Center (0.5): affects mode 1, 3 strongly
-        - 0.3/0.7: affects mode 2
-        - 0.15/0.85: affects mode 3
-        """
-        if n_cuts == 1:
-            positions = [0.5]
-        elif n_cuts == 3:
-            positions = [0.5, 0.3, 0.7]
-        elif n_cuts == 5:
-            positions = [0.5, 0.35, 0.65, 0.2, 0.8]
-        elif n_cuts == 7:
-            positions = [0.5, 0.35, 0.65, 0.25, 0.75, 0.15, 0.85]
-        elif n_cuts == 9:
-            positions = [0.5, 0.4, 0.6, 0.3, 0.7, 0.2, 0.8, 0.12, 0.88]
-        else:
-            # Symmetric distribution
-            half = n_cuts // 2
-            positions = [0.5]
-            for i in range(1, half + 1):
-                offset = 0.15 + 0.3 * i / half
-                positions.extend([0.5 - offset, 0.5 + offset])
-            positions = positions[:n_cuts]
-        
-        return cls(
-            positions=positions,
-            width_mm=width_mm,
-            max_depth_fraction=0.85
-        )
-    
-    @classmethod
-    def compact(cls, width_mm: float = 1.0) -> 'UndercutConfig':
-        """
-        Compact 5-cut pattern for 2–3 mode tuning.
-
-        Covers the central region where modes 1 and 2 have the highest
-        curvature.  Fewer cuts means faster optimisation and simpler
-        machining while still giving good control over the first two or
-        three modes.  Combine with length optimisation for best results.
-
-        Free-free beam reference positions:
-          Mode 1 antinode: 0.50
-          Mode 2 antinodes: ~0.31, 0.69
-
-        5 cuts (3 independent with symmetry).
-        """
-        positions = [
-            0.50,             # Mode 1 antinode, mode 3 antinode
-            0.45, 0.55,       # Near centre — strong mode 1 effect
-            0.38, 0.62,       # Mode 1/2 overlap region
-        ]
-
-        return cls(
-            positions=positions,
-            width_mm=width_mm,
-            max_depth_fraction=0.85
-        )
-
-    @classmethod
-    def standard(cls, width_mm: float = 1.0) -> 'UndercutConfig':
-        """
-        Full 11-cut pattern for 3-mode tuning.
-
-        Cuts placed at mode 1–3 curvature peaks of a free-free beam.
-        Suitable for any 3-mode idiophone tuning (e.g. 1:3:6, 1:4:10).
-
-        Free-free beam reference positions:
-          Mode 1: antinode 0.50; nodes 0.224, 0.776
-          Mode 2: antinodes ~0.31, 0.69; nodes 0.132, 0.50, 0.868
-          Mode 3: antinodes ~0.22, 0.50, 0.78; nodes 0.094, 0.356,
-                  0.644, 0.906
-
-        11 cuts (6 independent with symmetry).
-        """
-        positions = [
-            0.50,             # Mode 1 and 3 antinode
-            0.45, 0.55,       # Near centre — strong mode 1 effect
-            0.38, 0.62,       # Mode 1 region, some mode 2
-            0.30, 0.70,       # Mode 2 curvature region
-            0.22, 0.78,       # Mode 3 antinode, near mode 1 nodes
-            0.14, 0.86,       # Mode 3 curvature region, past mode 1 nodes
-        ]
-
-        return cls(
-            positions=positions,
-            width_mm=width_mm,
-            max_depth_fraction=0.85
-        )
-
-    @classmethod
-    def extended(cls, width_mm: float = 1.0) -> 'UndercutConfig':
-        """
-        Extended 15-cut pattern for 4-mode tuning.
-
-        Adds mode 4 antinode positions to the standard 3-mode layout.
-        Suitable for any 4-mode idiophone tuning (e.g. 1:3:6:10).
-
-        Mode 4 reference: antinodes ~0.175, 0.39, 0.61, 0.825;
-                           nodes 0.073, 0.277, 0.500, 0.723, 0.927
-
-        15 cuts (8 independent with symmetry).
-        """
-        positions = [
-            0.50,             # Mode 1, 3, 4 antinode
-            0.45, 0.55,       # Near centre — strong mode 1 effect
-            0.39, 0.61,       # Mode 4 antinode (~0.390, 0.610)
-            0.30, 0.70,       # Mode 2 curvature region
-            0.22, 0.78,       # Mode 3 antinode, near mode 1 nodes
-            0.175, 0.825,     # Mode 4 antinode (~0.175, 0.825)
-            0.14, 0.86,       # Mode 3 curvature region
-            0.09, 0.91,       # Mode 4 outer region
-        ]
-
-        return cls(
-            positions=positions,
-            width_mm=width_mm,
-            max_depth_fraction=0.85
-        )
-
-    @classmethod
-    def dense(cls, width_mm: float = 1.0) -> 'UndercutConfig':
-        """
-        Dense 15-cut pattern for maximum tuning control.
-
-        Cuts at 5% intervals from 15% to 85% of bar length.
-        Symmetric about centre.  Useful when the target ratios don't
-        match a standard pattern or when maximum flexibility is needed.
-        """
-        positions = [0.5]
-        for offset in [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35]:
-            positions.extend([0.5 - offset, 0.5 + offset])
+        if n_cuts < 1:
+            raise ValueError("n_cuts must be at least 1")
+        if n_cuts % 2 == 0:
+            n_cuts += 1
+        all_positions = _free_free_curvature_peaks()
+        positions = all_positions[:n_cuts]
 
         return cls(
             positions=sorted(positions),
             width_mm=width_mm,
             max_depth_fraction=0.85
         )
-
-    # Backwards-compatible aliases for the old xylophone_* names.
-    xylophone_physics = standard
-    xylophone_physics_4mode = extended
-    xylophone_dense = dense
 
 
 @dataclass

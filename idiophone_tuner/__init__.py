@@ -13,11 +13,11 @@ Quick start:
     result = quick_analysis(350, 32, 24, 'sapele')
     print(result['frequencies_hz'])
     
-    # Optimize for F4 xylophone tuning
+    # Optimize for F4 tuning (1:3:6 ratios)
     bar = create_bar(350, 32, 24)
     material = get_material('sapele')
     target = TuningTarget.from_note('F4', ratios=(1, 3, 6))
-    config = UndercutConfig.multi_point(n_cuts=3)
+    config = UndercutConfig.from_n_cuts(5)
     result = optimize_bar(bar, material, target, config)
     print(result.summary())
 """

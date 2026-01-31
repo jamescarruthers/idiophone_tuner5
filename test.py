@@ -76,15 +76,17 @@ target = TuningTarget.from_note(
 # =========================================================================
 # Undercut configuration
 # =========================================================================
-# Cut pattern presets:
-#   .single_center(width_mm)           1 cut
-#   .multi_point(n_cuts, width_mm)     1/3/5/7/9 symmetric cuts
-#   .compact(width_mm)                 5 cuts — fast, good for 2-3 modes
-#   .standard(width_mm)                11 cuts — full 3-mode coverage
-#   .extended(width_mm)                15 cuts — 4-mode coverage
-#   .dense(width_mm)                   15 cuts at 5% intervals
+# Cut positions are computed automatically from free-free beam curvature
+# peaks — the locations where material removal has the greatest effect.
+# Just choose the number of cuts (must be odd):
+#   .from_n_cuts(5)       3 independent — good for 2-3 modes
+#   .from_n_cuts(7)       4 independent — good for 3 modes
+#   .from_n_cuts(9)       5 independent — good for 3-4 modes
+#   .from_n_cuts(11)      6 independent — good for 4-5 modes
+#   .from_n_cuts(13)      7 independent — good for 5-6 modes
+#   .from_n_cuts(15)      8 independent — good for 6-7 modes
 
-config = UndercutConfig.compact(width_mm=1.0)
+config = UndercutConfig.from_n_cuts(5, width_mm=1.0)
 
 # --- Cut depth constraints ---
 config.min_depth_mm       = 0.0    # Floor: minimum cut depth (mm)
