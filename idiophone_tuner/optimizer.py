@@ -79,7 +79,8 @@ def frequency_to_note(freq: float) -> tuple[str, float]:
 # =============================================================================
 
 TUNING_RATIOS = {
-    'xylophone': (1.0, 3.0, 6.0),      # Western concert xylophone
+    'xylophone': (1.0, 3.0, 6.0),      # Western concert xylophone (3 modes)
+    'xylophone_4': (1.0, 3.0, 6.0, 10.0),  # 4-mode xylophone
     'marimba': (1.0, 4.0, 10.0),       # Concert marimba
     'vibraphone': (1.0, 4.0, None),    # Mode 3 not tuned
     'glockenspiel': (1.0, 2.76, 5.4),  # Metal bars (close to 1:2.76:5.4)
@@ -170,39 +171,36 @@ class UndercutConfig:
     @classmethod
     def xylophone_physics(cls, width_mm: float = 1.0) -> 'UndercutConfig':
         """
-        Physics-optimized positions for xylophone (1:3:6) tuning.
-        
+        Physics-optimized positions for xylophone tuning (up to 4 modes).
+
         Based on mode shape curvature analysis:
-        
+
         Mode 1 (fundamental): Max curvature at CENTER (0.5)
             - Nodes at 0.224, 0.776
-            
-        Mode 2: Max curvature at ~0.25, 0.75 (between its nodes)
+
+        Mode 2: Max curvature at ~0.31, 0.69 (between its nodes)
             - Nodes at 0.132, 0.5, 0.868
-            
-        Mode 3: Max curvature at ~0.17, 0.5, 0.83
+
+        Mode 3: Max curvature at ~0.22, 0.50, 0.78
             - Nodes at 0.094, 0.356, 0.644, 0.906
-        
-        To RAISE the ratios f2/f1 and f3/f1, we need f1 to drop MORE 
-        than f2 and f3. Strategy:
-        
-        - Heavy cuts at 0.5 (max mode 1 curvature, also mode 3)
-        - Cuts at 0.4, 0.6 (still high mode 1, less mode 2)  
-        - Cuts at 0.3, 0.7 (mode 2 region - use sparingly)
-        - Cuts at 0.2, 0.8 (transition)
-        - Cuts near 0.15, 0.85 (mode 3 curvature, past mode 1 nodes)
-        
-        11 cuts gives good resolution for independent mode control.
+
+        Mode 4: Max curvature at ~0.18, 0.39, 0.61, 0.83
+            - Nodes at 0.073, 0.277, 0.500, 0.723, 0.927
+
+        15 cuts (8 independent with symmetry) gives enough degrees of
+        freedom for independent 4-mode control.
         """
         positions = [
-            0.5,              # Center - affects f1 and f3 strongly
+            0.50,             # Center - affects f1, f3, f4 strongly
             0.45, 0.55,       # Near center - strong f1 effect
-            0.38, 0.62,       # f1 region, some f2
-            0.30, 0.70,       # f2 curvature region  
-            0.22, 0.78,       # Near f1 nodes - minimal f1 effect, affects f2/f3
+            0.39, 0.61,       # f4 antinode (~0.390, 0.610)
+            0.30, 0.70,       # f2 curvature region
+            0.22, 0.78,       # f3 antinode, near f1 nodes
+            0.175, 0.825,     # f4 antinode (~0.175, 0.825)
             0.14, 0.86,       # f3 curvature region, past f1 nodes
+            0.09, 0.91,       # Near f4 node (0.077, 0.923) / f3 outer region
         ]
-        
+
         return cls(
             positions=positions,
             width_mm=width_mm,
@@ -659,8 +657,9 @@ def optimize_bar(
                 cur_len_mm = (base_length + x[0]) * 1000
                 length_info = f"L={cur_len_mm:.1f}mm  "
 
+            ratio_str = ":".join(f"{r:.2f}" for r in ratios)
             print(f"[{eval_count[0]:4d}] {length_info}f1={freqs[0]:6.1f}Hz  "
-                  f"ratios=1:{ratios[1]:.2f}:{ratios[2]:.2f}  "
+                  f"ratios={ratio_str}  "
                   f"cost={cost:8.1f}  {marker}")
             sys.stdout.flush()
 
@@ -714,8 +713,9 @@ def optimize_bar(
                         cost, freqs = _compute_cost_and_freqs(xk)
                         if freqs is not None:
                             ratios = freqs / freqs[0]
+                            ratio_str = ":".join(f"{r:.2f}" for r in ratios)
                             print(f"[gen {de_gen_count[0]:3d}] f1={freqs[0]:6.1f}Hz  "
-                                  f"ratios=1:{ratios[1]:.2f}:{ratios[2]:.2f}  "
+                                  f"ratios={ratio_str}  "
                                   f"cost={cost:8.1f}  conv={convergence:.6f}")
                             sys.stdout.flush()
                     except Exception:
