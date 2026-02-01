@@ -53,6 +53,7 @@ from .optimizer import (
     UndercutConfig,
     OptimizationResult,
     optimize_bar,
+    spread_cuts,
     compute_tuning_guide,
     find_initial_length,
     quick_analysis,
@@ -81,6 +82,6 @@ __all__ = [
     
     # Optimization
     'TuningTarget', 'UndercutConfig', 'OptimizationResult',
-    'optimize_bar', 'compute_tuning_guide', 'find_initial_length', 'quick_analysis',
+    'optimize_bar', 'spread_cuts', 'compute_tuning_guide', 'find_initial_length', 'quick_analysis',
     'note_to_frequency', 'frequency_to_note', 'TUNING_RATIOS',
 ]

@@ -6,7 +6,7 @@ Adjust the values below to suit your bar, material, and workshop constraints.
 """
 
 from idiophone_tuner import (
-    create_bar, get_material, optimize_bar, compute_tuning_guide,
+    create_bar, get_material, optimize_bar, spread_cuts, compute_tuning_guide,
     TuningTarget, UndercutConfig
 )
 
@@ -194,15 +194,52 @@ if __name__ == '__main__':
 
 
     # =========================================================================
+    # Spread cuts: replace deep cuts with multiple shallow ones
+    # =========================================================================
+    # After finding ideal single-cut positions, spread each cut into a
+    # group of shallower cuts.  This reduces sensitivity to positioning
+    # errors and makes hand-cutting easier.
+    #
+    # n_per_side: number of extra cuts on each side of the ideal position.
+    #   1 → 3 cuts per group (1 left, centre, 1 right)
+    #   2 → 5 cuts per group
+    #   3 → 7 cuts per group
+    #
+    # spacing_mm: centre-to-centre distance between adjacent sub-cuts.
+    #   Defaults to the cut width (so sub-cuts sit edge-to-edge).
+    #   Increase for wider spacing, decrease for tighter grouping.
+
+    spread_result = spread_cuts(
+        result, bar, material, target, config,
+        n_per_side=2,                # 2 extra cuts each side → 5 per group
+        spacing_mm=None,             # None = same as cut width (edge-to-edge)
+        n_elements=120,
+        method='differential_evolution',
+        workers=-1,
+        convergence_cents=1.0,
+        verify_n_elements=1000,
+        verbose=True,
+    )
+
+    print(spread_result.summary())
+
+
+    # =========================================================================
     # Tuning guide for hand-finishing
     # =========================================================================
     # Shows how each cut affects each mode (cents per mm of additional depth).
     # Useful for fine-tuning after CNC roughing.
+    # (Uses the spread result if available, otherwise the original.)
 
     guide = compute_tuning_guide(
-        result, bar, material, config,
-        n_elements=60,               # Mesh resolution for sensitivity calc
+        spread_result, bar, material,
+        UndercutConfig(
+            positions=[u.center for u in spread_result.optimized_geometry.undercuts],
+            width_mm=config.width_mm,
+            profile=config.profile,
+        ),
+        n_elements=60,
         min_elements_per_cut=8,
-        delta_mm=0.1                 # Perturbation step for finite-difference
+        delta_mm=0.1
     )
     print(guide)

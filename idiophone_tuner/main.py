@@ -13,7 +13,7 @@ from .materials import get_material, list_materials, Material
 from .geometry import create_bar, BarGeometry
 from .timoshenko import modal_analysis, compute_frequencies, euler_bernoulli_free_free_frequencies
 from .optimizer import (
-    TuningTarget, UndercutConfig, optimize_bar, 
+    TuningTarget, UndercutConfig, optimize_bar, spread_cuts,
     find_initial_length, quick_analysis,
     note_to_frequency, frequency_to_note, TUNING_RATIOS
 )
@@ -123,7 +123,19 @@ def optimize_command(args):
     )
     
     print("\n" + result.summary())
-    
+
+    # Spread cuts if requested
+    if args.spread:
+        spread_result = spread_cuts(
+            result, base_bar, material, target, undercut_config,
+            n_per_side=args.spread,
+            spacing_mm=args.spread_spacing if args.spread_spacing else None,
+            n_elements=args.elements,
+            verbose=True
+        )
+        print("\n" + spread_result.summary())
+        result = spread_result  # Use spread result for plotting
+
     # Show the thickness profile
     if args.plot:
         try:
@@ -274,6 +286,11 @@ Examples:
     opt_parser.add_argument('--cuts', type=int, default=3, help='Number of undercuts')
     opt_parser.add_argument('--cut-width', type=float, default=3.0, help='Undercut width (mm)')
     opt_parser.add_argument('--elements', type=int, default=100, help='FEM elements')
+    opt_parser.add_argument('--spread', type=int, default=0, metavar='N',
+                           help='Spread each cut into multiple shallow cuts '
+                                '(N extra cuts per side, e.g. 2 = 5 cuts per group)')
+    opt_parser.add_argument('--spread-spacing', type=float, default=None, metavar='MM',
+                           help='Spacing between spread sub-cuts (mm, default=cut width)')
     opt_parser.add_argument('--plot', action='store_true', help='Generate plots')
     
     # Materials command

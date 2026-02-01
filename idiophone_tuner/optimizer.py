@@ -1365,6 +1365,126 @@ def compute_tuning_guide(
     return "\n".join(lines)
 
 
+def spread_cuts(
+    result: OptimizationResult,
+    base_geometry: BarGeometry,
+    material: Material,
+    target: TuningTarget,
+    original_config: UndercutConfig,
+    n_per_side: int = 2,
+    spacing_mm: Optional[float] = None,
+    merge_tol_mm: Optional[float] = None,
+    **optimize_kwargs,
+) -> OptimizationResult:
+    """Replace each optimised cut with multiple shallower cuts.
+
+    After :func:`optimize_bar` finds ideal single-cut positions and
+    depths, this function expands each position into a group of
+    ``2 * n_per_side + 1`` cuts spread evenly around the ideal
+    location.  The depths are then re-optimised so the expanded cuts
+    collectively produce the same target frequencies.
+
+    The result is a bar with many shallow cuts instead of a few deep
+    ones, which is less sensitive to positioning errors and easier to
+    produce in a workshop.
+
+    Args:
+        result: The output of a previous :func:`optimize_bar` call.
+        base_geometry: The original bar geometry (pre-optimisation).
+        material: Material properties.
+        target: The tuning target (same as the first optimisation).
+        original_config: The undercut config used in the first pass.
+        n_per_side: Number of extra cuts on *each* side of every
+            original position (total per group = ``2 * n_per_side + 1``).
+        spacing_mm: Centre-to-centre distance between adjacent sub-cuts
+            (mm).  Defaults to the cut width.
+        merge_tol_mm: Sub-cuts from different groups closer than this
+            are merged into one position.  Defaults to half the cut
+            width.
+        **optimize_kwargs: Forwarded to :func:`optimize_bar` (e.g.
+            ``n_elements``, ``method``, ``workers``, ``verbose``,
+            ``convergence_cents``, ``verify_n_elements``).
+
+    Returns:
+        A new :class:`OptimizationResult` with the spread-cut geometry.
+    """
+    if n_per_side < 1:
+        raise ValueError("n_per_side must be at least 1")
+    if spacing_mm is None:
+        spacing_mm = original_config.width_mm
+    if merge_tol_mm is None:
+        merge_tol_mm = original_config.width_mm * 0.5
+
+    # Use the optimised bar length from the first pass.
+    if result.optimized_length_mm is not None:
+        bar_length_m = result.optimized_length_mm / 1000
+    else:
+        bar_length_m = base_geometry.length
+
+    spacing_frac = (spacing_mm / 1000) / bar_length_m
+    merge_tol_frac = (merge_tol_mm / 1000) / bar_length_m
+
+    # Expand each original position into a group of sub-cuts.
+    original_positions = sorted(original_config.positions)
+    expanded = []
+    for pos in original_positions:
+        for k in range(-n_per_side, n_per_side + 1):
+            new_pos = pos + k * spacing_frac
+            # Keep within a safe interior margin.
+            if 0.02 <= new_pos <= 0.98:
+                expanded.append(round(new_pos, 6))
+
+    # Sort and merge positions that are too close together.
+    expanded.sort()
+    merged = [expanded[0]]
+    for p in expanded[1:]:
+        if p - merged[-1] >= merge_tol_frac:
+            merged.append(p)
+    new_positions = merged
+
+    n_original = len(original_positions)
+    n_spread = len(new_positions)
+
+    # Build a new UndercutConfig with spread positions.
+    new_config = UndercutConfig(
+        positions=new_positions,
+        width_mm=original_config.width_mm,
+        min_depth_mm=original_config.min_depth_mm,
+        max_depth_fraction=original_config.max_depth_fraction,
+        profile=original_config.profile,
+        # Fix bar length — don't re-optimise length in the spread pass.
+        max_trim_mm=0.0,
+        max_extend_mm=0.0,
+        depth_penalty_weight=original_config.depth_penalty_weight,
+        length_penalty_weight=0.0,
+        total_depth_penalty_weight=original_config.total_depth_penalty_weight,
+        max_total_depth_mm=original_config.max_total_depth_mm,
+    )
+
+    # Create the base bar at the optimised length.
+    spread_bar = BarGeometry(
+        length=bar_length_m,
+        width=base_geometry.width,
+        thickness=base_geometry.thickness,
+        undercuts=[],
+    )
+
+    if 'verbose' not in optimize_kwargs:
+        optimize_kwargs['verbose'] = True
+    if optimize_kwargs.get('verbose', False):
+        cuts_per = 2 * n_per_side + 1
+        print(f"\nSPREADING CUTS: {n_original} original → {n_spread} spread "
+              f"(up to {cuts_per} per group, spacing {spacing_mm:.1f} mm)")
+        print(f"Spread positions: {[f'{p:.1%}' for p in new_positions]}")
+        print("")
+
+    # Re-optimise depths for the spread configuration.
+    return optimize_bar(
+        spread_bar, material, target, new_config,
+        **optimize_kwargs,
+    )
+
+
 def find_initial_length(
     width_mm: float,
     thickness_mm: float,
