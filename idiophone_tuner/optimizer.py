@@ -730,7 +730,8 @@ def optimize_bar(
     workers: int = 1,
     min_elements_per_cut: int = 8,
     convergence_cents: Optional[float] = None,
-    verify_n_elements: Optional[int] = None
+    verify_n_elements: Optional[int] = None,
+    x0: Optional[np.ndarray] = None
 ) -> OptimizationResult:
     """
     Optimize undercut depths to achieve target frequencies.
@@ -757,6 +758,9 @@ def optimize_bar(
         verify_n_elements: If set, run a high-resolution verification after
             optimisation using this many coarse elements.  The summary will
             show both the optimiser-mesh and high-res results side by side.
+        x0: Optional initial guess for the optimisation vector (depths in
+            metres, with an optional leading length-offset).  Used by
+            SLSQP; ignored by differential_evolution.
 
     Returns:
         OptimizationResult with optimized geometry and achieved frequencies
@@ -1032,8 +1036,7 @@ def optimize_bar(
                                   f"+/-{convergence_cents:.1f} cents of target")
                         return True
 
-            result = differential_evolution(
-                fast_obj,
+            de_kwargs = dict(
                 bounds=bounds,
                 maxiter=500,
                 tol=de_tol,
@@ -1044,8 +1047,11 @@ def optimize_bar(
                 recombination=0.7,
                 popsize=10,
                 updating='deferred',
-                callback=_de_callback
+                callback=_de_callback,
             )
+            if x0 is not None:
+                de_kwargs['x0'] = x0
+            result = differential_evolution(fast_obj, **de_kwargs)
         else:
             # Single process: use closure with full progress, immediate updating
             def _sp_callback(xk, convergence):
@@ -1055,8 +1061,7 @@ def optimize_bar(
                               f"+/-{convergence_cents:.1f} cents of target")
                     return True
 
-            result = differential_evolution(
-                objective,
+            de_kwargs = dict(
                 bounds=bounds,
                 maxiter=500,
                 tol=de_tol,
@@ -1067,8 +1072,11 @@ def optimize_bar(
                 recombination=0.7,
                 popsize=10,
                 updating='immediate',
-                callback=_sp_callback if convergence_cents is not None else None
+                callback=_sp_callback if convergence_cents is not None else None,
             )
+            if x0 is not None:
+                de_kwargs['x0'] = x0
+            result = differential_evolution(objective, **de_kwargs)
 
         optimal_result_x = result.x
         success = result.success or converged[0]
@@ -1077,8 +1085,9 @@ def optimize_bar(
 
     elif method == 'SLSQP':
         # Local gradient-based optimizer
-        x0_depths = [max_depth * 0.3 for _ in range(n_independent)]
-        x0 = np.array(([0.0] + x0_depths) if optimize_length else x0_depths)
+        if x0 is None:
+            x0_depths = [max_depth * 0.3 for _ in range(n_independent)]
+            x0 = np.array(([0.0] + x0_depths) if optimize_length else x0_depths)
         result = minimize(
             objective,
             x0,
@@ -1374,6 +1383,7 @@ def spread_cuts(
     n_per_side: int = 2,
     spacing_mm: Optional[float] = None,
     merge_tol_mm: Optional[float] = None,
+    max_depth_mm: Optional[float] = None,
     **optimize_kwargs,
 ) -> OptimizationResult:
     """Replace each optimised cut with multiple shallower cuts.
@@ -1401,6 +1411,11 @@ def spread_cuts(
         merge_tol_mm: Sub-cuts from different groups closer than this
             are merged into one position.  Defaults to half the cut
             width.
+        max_depth_mm: Maximum depth per sub-cut (mm).  Defaults to
+            twice the deepest original cut divided by the group size,
+            giving each sub-cut a ceiling well below the original depth
+            while leaving enough headroom for the re-optimisation to
+            converge.
         **optimize_kwargs: Forwarded to :func:`optimize_bar` (e.g.
             ``n_elements``, ``method``, ``workers``, ``verbose``,
             ``convergence_cents``, ``verify_n_elements``).
@@ -1420,6 +1435,33 @@ def spread_cuts(
         bar_length_m = result.optimized_length_mm / 1000
     else:
         bar_length_m = base_geometry.length
+
+    n_per_group = 2 * n_per_side + 1
+
+    # Cap per-sub-cut depth so the optimizer produces genuinely
+    # shallower cuts instead of concentrating depth in a few sub-cuts.
+    #
+    # Stiffness scales as h³, so the equivalent single-cut depth for
+    # n co-located cuts at depth d_s is:
+    #     d_eq = H - n^(1/3) * (H - d_s)
+    # Inverting: d_s = H - n^(1/3) * (H - d_eq)
+    # This means the per-sub-cut ceiling is still fairly deep (e.g.
+    # ~80% of the original for 5 cuts) — that's just physics.
+    thickness_mm = base_geometry.thickness * 1000
+    if max_depth_mm is None:
+        deepest_mm = max(result.undercut_depths_mm)
+        remaining_mm = thickness_mm - deepest_mm
+        equivalent_depth_mm = thickness_mm - n_per_group ** (1 / 3) * remaining_mm
+        # 1.2× headroom so the optimizer can converge; sub-cuts at
+        # offset positions have slightly different modal sensitivity.
+        max_depth_mm = min(
+            equivalent_depth_mm * 1.2,
+            thickness_mm * original_config.max_depth_fraction,
+        )
+    spread_max_depth_fraction = min(
+        max_depth_mm / thickness_mm,
+        original_config.max_depth_fraction,
+    )
 
     spacing_frac = (spacing_mm / 1000) / bar_length_m
     merge_tol_frac = (merge_tol_mm / 1000) / bar_length_m
@@ -1450,7 +1492,7 @@ def spread_cuts(
         positions=new_positions,
         width_mm=original_config.width_mm,
         min_depth_mm=original_config.min_depth_mm,
-        max_depth_fraction=original_config.max_depth_fraction,
+        max_depth_fraction=spread_max_depth_fraction,
         profile=original_config.profile,
         # Fix bar length — don't re-optimise length in the spread pass.
         max_trim_mm=0.0,
@@ -1469,12 +1511,37 @@ def spread_cuts(
         undercuts=[],
     )
 
+    # Build a good initial guess from the original result.
+    # For each spread position, find the nearest original cut and
+    # compute the equivalent depth using the cubic stiffness relation:
+    #     d_s = H - n^(1/3) * (H - d_orig)
+    if 'x0' not in optimize_kwargs:
+        orig_depths_m = np.array(result.undercut_depths_mm) / 1000
+        orig_pos = np.array(original_positions)
+        H = base_geometry.thickness
+        max_depth_m = max_depth_mm / 1000
+
+        full_x0 = np.empty(n_spread)
+        for i, pos in enumerate(new_positions):
+            nearest_idx = int(np.argmin(np.abs(orig_pos - pos)))
+            d_orig = orig_depths_m[nearest_idx]
+            remaining = H - d_orig
+            # Cubic equivalence: n co-located cuts at d_s match one at d_orig
+            d_s = H - n_per_group ** (1 / 3) * remaining
+            full_x0[i] = np.clip(d_s, 0.0, max_depth_m)
+
+        # Map full depths → independent variables via the symmetry map.
+        sym_matrix, sym_groups = _build_symmetry_map(new_positions)
+        x0_indep = np.array([full_x0[g[0]] for g in sym_groups])
+        optimize_kwargs['x0'] = x0_indep
+
     if 'verbose' not in optimize_kwargs:
         optimize_kwargs['verbose'] = True
     if optimize_kwargs.get('verbose', False):
-        cuts_per = 2 * n_per_side + 1
         print(f"\nSPREADING CUTS: {n_original} original → {n_spread} spread "
-              f"(up to {cuts_per} per group, spacing {spacing_mm:.1f} mm)")
+              f"(up to {n_per_group} per group, spacing {spacing_mm:.1f} mm)")
+        print(f"Max depth per sub-cut: {max_depth_mm:.1f} mm "
+              f"(max_depth_fraction={spread_max_depth_fraction:.3f})")
         print(f"Spread positions: {[f'{p:.1%}' for p in new_positions]}")
         print("")
 

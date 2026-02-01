@@ -214,9 +214,9 @@ if __name__ == '__main__':
         n_per_side=2,                # 2 extra cuts each side → 5 per group
         spacing_mm=None,             # None = same as cut width (edge-to-edge)
         n_elements=120,
-        method='differential_evolution',
-        workers=-1,
-        convergence_cents=1.0,
+        # method defaults to SLSQP — fast local optimiser that works
+        # well here because the first pass already found a good region.
+        # Override with method='differential_evolution' for a global search.
         verify_n_elements=1000,
         verbose=True,
     )
