@@ -90,7 +90,7 @@ target = TuningTarget.from_note(
 #   .from_n_cuts(13)      7 independent — good for 5-6 modes
 #   .from_n_cuts(15)      8 independent — good for 6-7 modes
 
-config = UndercutConfig.from_n_cuts(7, width_mm=1.0,
+config = UndercutConfig.from_n_cuts(7, width_mm=40.0,
                                     bar=bar, material=material,
                                     n_modes=len(target.ratios))
 
@@ -104,7 +104,7 @@ config.max_depth_fraction = 0.85   # Ceiling: max depth as fraction of thickness
 # 'parabolic'  — smooth arch (hand-carved)
 # 'cosine'     — smooth with gentle edges
 # 'elliptical' — elliptical arch
-config.profile = 'flat'
+config.profile = 'parabolic'
 
 # --- Bar length constraints ---
 # Allow the optimiser to shorten or lengthen the bar to help hit f1.
